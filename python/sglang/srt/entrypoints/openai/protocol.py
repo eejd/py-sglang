@@ -787,8 +787,8 @@ ChatCompletionMessageParam = Union[
 class Function(BaseModel):
     """Function descriptions."""
 
-    description: Optional[str] = Field(default=None, examples=[None])
     name: str
+    description: Optional[str] = Field(default=None, examples=[None])
     parameters: Optional[object] = None
     strict: bool = False
     defer_loading: Optional[bool] = None
@@ -813,6 +813,16 @@ class Tool(BaseModel):
         if self.defer_loading is not None and self.function.defer_loading is None:
             self.function.defer_loading = self.defer_loading
         return self
+
+    def to_template_dict(self) -> dict:
+        """The tool as the client sent it, for the chat template.
+
+        Templates render ``tools`` verbatim (``{{ tool | tojson }}``), so a field
+        the client never set (``strict: false``, ``defer_loading: null``) would
+        add tokens the model was not shown by any other engine and shift greedy
+        decoding. Only what was set is rendered, and ``Function`` declares
+        ``name`` first, the order of the OpenAI schema."""
+        return self.model_dump(exclude_unset=True)
 
 
 # Tool is defined after the message params that reference it, so the forward

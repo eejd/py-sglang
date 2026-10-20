@@ -730,6 +730,40 @@ class TestFunctionDeferLoading(unittest.TestCase):
         )
         self.assertFalse(tool.function.defer_loading)
 
+    def test_tool_template_dict_is_the_tool_as_sent(self):
+        """The chat template renders `tool | tojson`: a tool must reach it with the
+        keys, and the key order, the client sent, not with `strict: false` and
+        `defer_loading: null` added (11 tokens per tool on Qwen3.5's template)."""
+        sent = {
+            "type": "function",
+            "function": {
+                "name": "echo_args",
+                "description": "Record the given values.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                },
+            },
+        }
+
+        rendered = Tool(**sent).to_template_dict()
+
+        self.assertEqual(rendered, sent)
+        self.assertEqual(json.dumps(rendered), json.dumps(sent))
+
+    def test_tool_template_dict_keeps_what_the_client_set(self):
+        tool = Tool(
+            defer_loading=True,
+            function={"name": "search_db", "strict": True},
+        )
+
+        rendered = tool.to_template_dict()
+
+        self.assertEqual(rendered["function"]["strict"], True)
+        self.assertEqual(rendered["function"]["defer_loading"], True)
+        self.assertEqual(rendered["defer_loading"], True)
+
     def test_tool_reference_content_part_accepted(self):
         """Chat completion should accept tool_reference content on tool-role
         messages (GLM-specific extension consumed by the chat template)."""
