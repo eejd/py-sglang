@@ -19,3 +19,7 @@ posted to `sgl-project/sglang` before the quantbench + agentbench soak (ADR-0008
 
 | Topic | Upstream PR | Status |
 |---|---|---|
+| `topic/mlx-hybrid-radix-auto-no-buffer` | none yet | draft PR eejd/py-sglang#7 (eejd/py-sglang#3) |
+| `topic/mlx-non-overlap-relay-device` | none yet | draft PR eejd/py-sglang#8 (eejd/py-sglang#5) |
+| `topic/tools-block-as-sent` | none yet | draft PR eejd/py-sglang#9 (eejd/py-sglang#4) |
+| `topic/mlx-grammar-requires-sampling` | none yet | draft PR eejd/py-sglang#10 (eejd/py-sglang#6) |
