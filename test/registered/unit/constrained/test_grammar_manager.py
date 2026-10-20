@@ -192,6 +192,9 @@ class TestProcessReqWithGrammar(unittest.TestCase):
         mgr = GrammarManager(scheduler)
         mgr.grammar_backend = MagicMock(spec=BaseGrammarBackend)
         mgr.grammar_backend.get_request_grammar_key.side_effect = lambda key, **_: key
+        # A grammar the backend would compile, so a path that wrongly reaches it
+        # fails on behaviour (the request is queued), not on a mock attribute.
+        mgr.grammar_backend.get_cached_or_future_value.return_value = (Future(), False)
         return mgr
 
     def test_no_constraint_returns_false(self):
