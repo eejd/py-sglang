@@ -3035,7 +3035,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     self.assertEqual(
                         _mamba_radix_cache_resolution(
                             _view(
-                                architecture, disable_overlap_schedule=True, page_size=64
+                                architecture,
+                                disable_overlap_schedule=True,
+                                page_size=64,
                             )
                         ),
                         no_buffer,
