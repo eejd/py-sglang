@@ -830,7 +830,9 @@ class Tool(BaseModel):
             for key in ("name", "description", "parameters", "strict", "defer_loading")
             if function.get(key) is not None
         }
-        ordered.update({k: v for k, v in function.items() if k not in ordered})
+        ordered.update(
+            {k: v for k, v in function.items() if k not in ordered and v is not None}
+        )
         data["function"] = ordered
         return {k: v for k, v in data.items() if v is not None}
 
