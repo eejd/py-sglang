@@ -353,15 +353,43 @@ class TestProcessReqWithGrammar(unittest.TestCase):
             with self.subTest(constraint=constraint):
                 req = _make_req(**constraint)
                 with patch(
-                    "sglang.srt.constrained.grammar_manager.use_mlx",
+                    "sglang.srt.hardware_backend.mlx.runtime.use_mlx",
                     return_value=True,
                 ):
                     self.assertFalse(mgr.process_req_with_grammar(req))
                 req.set_finish_with_abort.assert_called_once()
-                self.assertIn(
-                    "--mlx-enable-sampling", req.set_finish_with_abort.call_args[0][0]
-                )
+                message = req.set_finish_with_abort.call_args[0][0]
+                self.assertIn("--mlx-enable-sampling", message)
+                self.assertIn("tool_choice", message)
                 mgr.grammar_backend.get_cached_or_future_value.assert_not_called()
+
+    def test_mlx_without_sampling_serves_a_server_imposed_full_assistant_ebnf(self):
+        """GLM47 puts a full-assistant EBNF on every tool request; a default MLX
+        launch cannot enforce it, but its parser reads unconstrained text, so the
+        request runs unconstrained (one warning) instead of being refused."""
+        mgr = self._make_mgr()
+        enter_override(
+            self, get_context().override_server_args(mlx_enable_sampling=False)
+        )
+        GrammarManager._warned_mlx_unconstrained = False
+        self.addCleanup(setattr, GrammarManager, "_warned_mlx_unconstrained", False)
+
+        logger_name = "sglang.srt.constrained.grammar_manager"
+        for first in (True, False):
+            req = _make_req(ebnf="root ::= 'a'")
+            req.sampling_params.ebnf_full_assistant = True
+            with patch(
+                "sglang.srt.hardware_backend.mlx.runtime.use_mlx", return_value=True
+            ):
+                if first:
+                    with self.assertLogs(logger_name, level="WARNING"):
+                        self.assertFalse(mgr.process_req_with_grammar(req))
+                else:
+                    with self.assertNoLogs(logger_name, level="WARNING"):
+                        self.assertFalse(mgr.process_req_with_grammar(req))
+            req.set_finish_with_abort.assert_not_called()
+            self.assertIsNone(req.grammar)
+        mgr.grammar_backend.get_cached_or_future_value.assert_not_called()
 
     def test_mlx_with_sampling_compiles_the_grammar(self):
         mgr = self._make_mgr()
@@ -373,7 +401,7 @@ class TestProcessReqWithGrammar(unittest.TestCase):
         req = _make_req(json_schema='{"type": "object"}')
 
         with patch(
-            "sglang.srt.constrained.grammar_manager.use_mlx", return_value=True
+            "sglang.srt.hardware_backend.mlx.runtime.use_mlx", return_value=True
         ):
             self.assertTrue(mgr.process_req_with_grammar(req))
 

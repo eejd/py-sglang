@@ -14,7 +14,7 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.hardware_backend.mlx import runtime as mlx_runtime
 from sglang.srt.runtime_context import get_device, get_parallel, get_serving
 from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 
 
 class GrammarManager:
+    _warned_mlx_unconstrained = False
+
     def __init__(self, scheduler: Scheduler):
         self.scheduler = scheduler
         self.server_args = scheduler.server_args
@@ -155,13 +157,26 @@ class GrammarManager:
             if self.grammar_backend is None:
                 error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag) is not supported when the server is launched with --grammar-backend none"
                 req.set_finish_with_abort(error_msg)
-            elif use_mlx() and not get_device().mlx_enable_sampling:
+            elif mlx_runtime.use_mlx() and not get_device().mlx_enable_sampling:
                 # The MLX path takes the argmax of the raw logits unless sampling
                 # is enabled, and only the sampling path applies a vocab mask. A
                 # grammar would be compiled, never enforced, and then reject the
                 # first token the model emits on its own.
-                error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag) on the MLX backend requires --mlx-enable-sampling: without it the MLX path does not apply the grammar's vocab mask"
-                req.set_finish_with_abort(error_msg)
+                if req.sampling_params.ebnf_full_assistant:
+                    # Imposed by the server (GLM47 puts it on every request with
+                    # tools), not asked for by the client, and its parser still
+                    # reads unconstrained text: serve the request unconstrained.
+                    if not GrammarManager._warned_mlx_unconstrained:
+                        GrammarManager._warned_mlx_unconstrained = True
+                        logger.warning(
+                            "The MLX backend without --mlx-enable-sampling cannot "
+                            "apply the tool-call grammar of this parser; tool "
+                            "requests run unconstrained. Pass --mlx-enable-sampling "
+                            "to enforce it."
+                        )
+                else:
+                    error_msg = "Grammar-based generation (response_format json_schema/regex/ebnf, structural_tag, tool_choice required or a named function, strict tools) on the MLX backend requires --mlx-enable-sampling: without it the MLX path does not apply the grammar's vocab mask"
+                    req.set_finish_with_abort(error_msg)
             else:
                 if req.sampling_params.json_schema is not None:
                     key = ("json", req.sampling_params.json_schema)
