@@ -37,7 +37,9 @@ class TestNonOverlapRelayAcrossDevices(unittest.TestCase):
         for index_device in ("cpu", "mps"):
             with self.subTest(index_device=index_device):
                 future_map = self._future_map()
-                indices = torch.tensor([1, 2, 3], dtype=torch.int64, device=index_device)
+                indices = torch.tensor(
+                    [1, 2, 3], dtype=torch.int64, device=index_device
+                )
                 tokens = torch.tensor([11, 22, 33], dtype=torch.int64)  # CPU, as MLX
 
                 future_map.stash(indices, RelayPayload(bonus_tokens=tokens))
