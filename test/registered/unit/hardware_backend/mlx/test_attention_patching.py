@@ -8,6 +8,7 @@ from collections import deque
 from types import SimpleNamespace
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_mlx_ci
 
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
@@ -94,9 +95,11 @@ def _set_dummy_server_args_for_auxiliary_state_tests() -> None:
     set_global_server_args_for_scheduler(server_args)
 
 
-def _auxiliary_state_component_params() -> SimpleNamespace:
+def _auxiliary_state_component_params(test: unittest.TestCase) -> SimpleNamespace:
     """The cache-init params of a no_buffer tree, with the server args the
-    component's checkpoint geometry reads published (production has both)."""
+    component's checkpoint geometry reads published (production has both) and
+    unpublished again when the test ends."""
+    test.addCleanup(reset_context)
     _set_dummy_server_args_for_auxiliary_state_tests()
     return SimpleNamespace(enable_mamba_extra_buffer=False, page_size=1)
 
@@ -975,7 +978,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         req.kv.mamba_last_track_seqlen = 64
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
-            _auxiliary_state_component_params(),
+            _auxiliary_state_component_params(self),
         )
         insert_params = InsertParams()
 
@@ -1016,7 +1019,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
-            _auxiliary_state_component_params(),
+            _auxiliary_state_component_params(self),
         )
         node = SimpleNamespace(
             component_data={
@@ -1054,7 +1057,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         req.kv.mamba_last_track_seqlen = 64
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
-            _auxiliary_state_component_params(),
+            _auxiliary_state_component_params(self),
         )
         insert_params = InsertParams()
 
@@ -1094,7 +1097,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         req.kv.mamba_next_track_idx = 0
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
-            _auxiliary_state_component_params(),
+            _auxiliary_state_component_params(self),
         )
         insert_params = InsertParams()
 
@@ -1131,7 +1134,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         pool.alloc([req])
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
-            _auxiliary_state_component_params(),
+            _auxiliary_state_component_params(self),
         )
         insert_params = InsertParams()
 
