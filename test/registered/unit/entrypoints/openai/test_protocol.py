@@ -771,7 +771,11 @@ class TestFunctionDeferLoading(unittest.TestCase):
         tool = Tool(
             type="function",
             defer_loading=None,
-            function={"name": "f", "description": None, "parameters": {"type": "object"}},
+            function={
+                "name": "f",
+                "description": None,
+                "parameters": {"type": "object"},
+            },
         )
 
         self.assertEqual(
