@@ -495,7 +495,9 @@ class FutureMap:
     ) -> None:
         """Write only output_tokens_buf rows; for relays carrying no draft
         extras (stash() would lazy-init the spec bufs from the payload)."""
-        self.output_tokens_buf[indices] = bonus_tokens.to(self.output_tokens_buf.dtype)
+        self.output_tokens_buf[indices] = bonus_tokens.to(
+            device=self.output_tokens_buf.device, dtype=self.output_tokens_buf.dtype
+        )
 
     def resolve_mixed_spec_tails(self, batch: ScheduleBatch) -> None:
         """Late-bind a spec mixed batch's decode tails (overlap): schedule-time

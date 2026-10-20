@@ -33,13 +33,28 @@ class TestNonOverlapRelayAcrossDevices(unittest.TestCase):
         )
 
     def test_cpu_tokens_for_a_multi_request_batch_reach_the_device_buffer(self):
+        # Production shape: the scheduler's req_pool_indices are device tensors.
+        for index_device in ("cpu", "mps"):
+            with self.subTest(index_device=index_device):
+                future_map = self._future_map()
+                indices = torch.tensor([1, 2, 3], dtype=torch.int64, device=index_device)
+                tokens = torch.tensor([11, 22, 33], dtype=torch.int64)  # CPU, as MLX
+
+                future_map.stash(indices, RelayPayload(bonus_tokens=tokens))
+
+                self.assertEqual(
+                    future_map.output_tokens_buf[1:4].cpu().tolist(), [11, 22, 33]
+                )
+
+    def test_stash_bonus_tokens_accepts_cpu_tokens(self):
         future_map = self._future_map()
-        indices = torch.tensor([1, 2, 3], dtype=torch.int64)
-        tokens = torch.tensor([11, 22, 33], dtype=torch.int64)  # CPU, as MLX returns
 
-        future_map.stash(indices, RelayPayload(bonus_tokens=tokens))
+        future_map.stash_bonus_tokens(
+            torch.tensor([4, 5], dtype=torch.int64, device="mps"),
+            torch.tensor([7, 8], dtype=torch.int64),
+        )
 
-        self.assertEqual(future_map.output_tokens_buf[1:4].cpu().tolist(), [11, 22, 33])
+        self.assertEqual(future_map.output_tokens_buf[4:6].cpu().tolist(), [7, 8])
 
 
 if __name__ == "__main__":
