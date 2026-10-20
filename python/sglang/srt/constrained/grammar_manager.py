@@ -14,7 +14,8 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_parallel, get_serving
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.runtime_context import get_device, get_parallel, get_serving
 from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
 )
@@ -153,6 +154,13 @@ class GrammarManager:
         ):
             if self.grammar_backend is None:
                 error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag) is not supported when the server is launched with --grammar-backend none"
+                req.set_finish_with_abort(error_msg)
+            elif use_mlx() and not get_device().mlx_enable_sampling:
+                # The MLX path takes the argmax of the raw logits unless sampling
+                # is enabled, and only the sampling path applies a vocab mask. A
+                # grammar would be compiled, never enforced, and then reject the
+                # first token the model emits on its own.
+                error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag) on the MLX backend requires --mlx-enable-sampling: without it the MLX path does not apply the grammar's vocab mask"
                 req.set_finish_with_abort(error_msg)
             else:
                 if req.sampling_params.json_schema is not None:

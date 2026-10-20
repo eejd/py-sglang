@@ -336,6 +336,49 @@ class TestProcessReqWithGrammar(unittest.TestCase):
         req.set_finish_with_abort.assert_called_once()
         self.assertIn("not supported", req.set_finish_with_abort.call_args[0][0])
 
+    def test_mlx_without_sampling_refuses_a_grammar_it_cannot_enforce(self):
+        """The MLX path applies a vocab mask only with --mlx-enable-sampling; a
+        grammar request without it would run unconstrained, so it is refused."""
+        mgr = self._make_mgr()
+        enter_override(
+            self, get_context().override_server_args(mlx_enable_sampling=False)
+        )
+
+        for constraint in (
+            {"json_schema": '{"type": "object"}'},
+            {"regex": "a+"},
+            {"ebnf": "root ::= 'a'"},
+            {"structural_tag": "{}"},
+        ):
+            with self.subTest(constraint=constraint):
+                req = _make_req(**constraint)
+                with patch(
+                    "sglang.srt.constrained.grammar_manager.use_mlx",
+                    return_value=True,
+                ):
+                    self.assertFalse(mgr.process_req_with_grammar(req))
+                req.set_finish_with_abort.assert_called_once()
+                self.assertIn(
+                    "--mlx-enable-sampling", req.set_finish_with_abort.call_args[0][0]
+                )
+                mgr.grammar_backend.get_cached_or_future_value.assert_not_called()
+
+    def test_mlx_with_sampling_compiles_the_grammar(self):
+        mgr = self._make_mgr()
+        enter_override(
+            self, get_context().override_server_args(mlx_enable_sampling=True)
+        )
+        future = Future()
+        mgr.grammar_backend.get_cached_or_future_value.return_value = (future, False)
+        req = _make_req(json_schema='{"type": "object"}')
+
+        with patch(
+            "sglang.srt.constrained.grammar_manager.use_mlx", return_value=True
+        ):
+            self.assertTrue(mgr.process_req_with_grammar(req))
+
+        req.set_finish_with_abort.assert_not_called()
+
     def test_json_takes_priority_over_other_constraints(self):
         """When json_schema is set, it should be used regardless of other fields."""
         mgr = self._make_mgr()
