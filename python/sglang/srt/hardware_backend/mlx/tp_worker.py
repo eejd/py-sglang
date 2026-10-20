@@ -115,6 +115,7 @@ class MlxTpModelWorker(TpModelWorker):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
             mlx_pool_size=self._mlx_runner.pool_size,
+            mlx_max_live_requests=self._mlx_runner.max_live_requests,
         )
 
         self._mlx_active_rids: set[str] = set()

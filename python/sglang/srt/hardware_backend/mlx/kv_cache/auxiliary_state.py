@@ -25,7 +25,7 @@ from sglang.srt.mem_cache.unified_cache.components.mamba import (
 
 logger = logging.getLogger(__name__)
 
-_MIN_SLOTS = 8
+MIN_AUX_STATE_SLOTS = 8
 _CACHE_ATTRS = ("offset", "lengths", "left_padding")
 _MISSING = object()
 
@@ -57,6 +57,21 @@ def _arrays_in_tree(value: Any) -> list[mx.array]:
 
     collect(value)
     return arrays
+
+
+def cache_state_nbytes(cache: list[Any], layer_indices: Iterable[int]) -> int:
+    """Device bytes of the state a snapshot of *layer_indices* of *cache* holds."""
+    return sum(
+        array.nbytes
+        for layer_idx in layer_indices
+        for array in _arrays_in_tree(
+            (
+                getattr(cache[layer_idx], "state", ()),
+                getattr(cache[layer_idx], "meta_state", ()),
+                [getattr(cache[layer_idx], name, None) for name in _CACHE_ATTRS],
+            )
+        )
+    )
 
 
 @dataclass
@@ -98,9 +113,8 @@ class MlxAuxiliaryStatePool:
         self.device = device
         self.mamba_cache = None
         self.mem_usage = 0
-        # Device-memory budget for snapshots and the slot cap it implies once
-        # one snapshot's size is known (set_memory_budget / store_cache). Slots
-        # are cheap bookkeeping; the snapshots behind them are not.
+        # Device-memory budget for snapshots (set_memory_budget). Slots are cheap
+        # bookkeeping; the snapshots behind them are not.
         self._memory_budget_bytes: Optional[int] = None
         self._snapshot_bytes = 0
         self._snapshots: dict[int, dict[int, _CacheSnapshot]] = {}
@@ -115,20 +129,17 @@ class MlxAuxiliaryStatePool:
         assert flat.numel() == 1
         return int(flat.item())
 
-    def set_memory_budget(self, budget_bytes: int) -> None:
+    def set_memory_budget(self, budget_bytes: int, snapshot_bytes: int) -> None:
         """Bound the snapshots held (live requests and the radix tree) to
-        *budget_bytes* of device memory."""
-        self._memory_budget_bytes = budget_bytes
-        self._update_slot_cap()
+        *budget_bytes* of device memory, one snapshot being *snapshot_bytes*.
 
-    def _update_slot_cap(self) -> None:
-        """Shrink the pool to the slots the budget can back (never below the
-        highest slot in use, nor below a few slots). ``size`` is what the
-        scheduler's pool-invariant check counts against, so the pool itself
-        shrinks instead of hiding free slots."""
-        if self._memory_budget_bytes is None or self._snapshot_bytes <= 0:
-            return
-        cap = max(self._memory_budget_bytes // self._snapshot_bytes, _MIN_SLOTS)
+        Shrinks the pool to the slots that fit (never below the highest slot in
+        use, nor below ``MIN_AUX_STATE_SLOTS``). ``size`` is what the scheduler's
+        pool-invariant check counts against, so the pool itself shrinks instead
+        of hiding free slots."""
+        self._memory_budget_bytes = budget_bytes
+        self._snapshot_bytes = snapshot_bytes
+        cap = max(budget_bytes // max(snapshot_bytes, 1), MIN_AUX_STATE_SLOTS)
         if cap >= self.size:
             return
         in_use = set(range(1, self.size + 1)) - set(self.free_slots.tolist())
@@ -136,10 +147,10 @@ class MlxAuxiliaryStatePool:
         self.free_slots = self.free_slots[self.free_slots <= new_size]
         self.size = new_size
         logger.info(
-            "MLX auxiliary-state pool: %d slots of %.1f MB (budget %.2f GB)",
+            "MLX auxiliary-state pool: %d slots of %.1f MB (budget %.2f GiB)",
             new_size,
-            self._snapshot_bytes / 1e6,
-            self._memory_budget_bytes / 1e9,
+            snapshot_bytes / 1e6,
+            budget_bytes / 1024**3,
         )
 
     def available_size(self) -> int:
@@ -230,16 +241,6 @@ class MlxAuxiliaryStatePool:
         self._snapshots[self._index(index)] = {
             layer_idx: _snapshot_cache(cache[layer_idx]) for layer_idx in layer_indices
         }
-        if self._snapshot_bytes == 0:
-            snapshot = self._snapshots[self._index(index)]
-            self._snapshot_bytes = sum(
-                array.nbytes
-                for layer_snapshot in snapshot.values()
-                for array in _arrays_in_tree(
-                    (layer_snapshot.state, layer_snapshot.meta_state, layer_snapshot.attrs)
-                )
-            )
-            self._update_slot_cap()
 
     def restore_cache(
         self,
@@ -289,9 +290,9 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
         # Keep the MLX-owned name beside it so local code can avoid model-
         # specific terminology.
         self.auxiliary_state_pool = self.mamba_pool
-        # A request binds one live slot and the runner takes one more for a
-        # tracked (mid-prompt) snapshot; ensure_mamba_capacity reclaims radix-held
-        # snapshots for both before the request binds its slot.
+        # Declares one extra slot per request, the tracked (mid-prompt) snapshot
+        # the runner takes next to the live one; ensure_mamba_capacity counts it
+        # and reclaims radix-held snapshots for both before the request binds.
         self.mamba_initial_tracking_slots = 1
         self.enable_mamba_extra_buffer = False
         self.req_index_to_auxiliary_state_index_mapping = torch.zeros(

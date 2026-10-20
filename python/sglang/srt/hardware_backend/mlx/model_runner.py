@@ -58,6 +58,10 @@ from sglang.srt.hardware_backend.mlx.kv_cache import (
     set_context,
     uses_sliding_window_attention,
 )
+from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
+    MIN_AUX_STATE_SLOTS,
+    cache_state_nbytes,
+)
 from sglang.srt.hardware_backend.mlx.remote_code_gate import (
     ensure_remote_code_allowed,
     resolve_model_directory,
@@ -77,11 +81,16 @@ from sglang.srt.hardware_backend.mlx.sampling import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import (
+    get_parallel,
     get_schedule,
     mamba_cache_chunk_size,
 )
 
 logger = logging.getLogger(__name__)
+
+# Share of the device working set kept free for the running requests' own
+# attention KV (preallocated per request, outside the pool) and activations.
+_LIVE_REQUEST_RESERVE_FRACTION = 0.10
 
 
 @dataclass
@@ -666,19 +675,48 @@ class MlxModelRunner:
                 )
         return first_config
 
+    def _measure_request_footprint(self) -> tuple[int, int]:
+        """Measure what one request holds on the device, by running one token
+        through a fresh native cache: ``(snapshot_bytes, live_kv_bytes)``, the
+        auxiliary-state snapshot and the preallocated per-request attention KV."""
+        cache = self._new_native_cache()
+        self.model(mx.array([[0]], dtype=mx.int32), cache=cache)
+        arrays = [
+            a
+            for c in cache
+            for a in (getattr(c, "keys", None), getattr(c, "values", None))
+            if a is not None
+        ]
+        mx.eval(*arrays, *[getattr(c, "state", ()) for c in cache if c is not None])
+        snapshot_bytes = cache_state_nbytes(
+            cache, self._cache_layout.auxiliary_layer_indices
+        )
+        live_kv_bytes = sum(a.nbytes for a in arrays)
+        del cache, arrays
+        mx.clear_cache()
+        return snapshot_bytes, live_kv_bytes
+
     def _compute_pool_size(self, explicit_size: int | None) -> int:
         """Determine pool slot count (auto-size from available memory if needed).
 
-        A model with auxiliary (GDN/mamba) state and the radix cache on also keeps
-        one state snapshot per cached prefix. Those snapshots are real device
-        memory, so the budget is split between the KV pool and them with the
-        server's ``mamba_full_memory_ratio`` (as CUDA does) and the share left
-        for snapshots is handed to the auxiliary-state pool in
-        ``init_cache_pools``; otherwise the KV pool takes the whole budget and
-        the snapshots run the device out of memory.
+        A model with auxiliary (GDN/mamba) state and the radix cache on also
+        keeps one state snapshot per cached prefix, and every running request
+        holds its own preallocated attention KV. All of it is real device memory,
+        so the budget is split: a reserve for the running requests' KV (which also
+        bounds ``max_live_requests``), then the server's ``mamba_full_memory_ratio``
+        between the KV pool and the snapshots (as CUDA does), or an explicit
+        ``--max-mamba-cache-size`` times the measured snapshot size. The share left
+        for snapshots goes to the auxiliary-state pool in ``init_cache_pools``;
+        otherwise the KV pool takes the whole budget and the snapshots and the
+        live caches run the device out of memory.
         """
         self._aux_state_budget_bytes: int | None = None
-        if explicit_size is not None:
+        self._snapshot_bytes: int | None = None
+        self.max_live_requests: int | None = None
+        hybrid_radix = (
+            self._cache_layout.has_auxiliary_state and not self.disable_radix_cache
+        )
+        if explicit_size is not None and not hybrid_radix:
             return explicit_size
         n_kv_heads, head_dim, dtype = self._get_attn_config()
         # Only full-attention layers occupy pool slots. All-SWA models have no
@@ -699,19 +737,48 @@ class MlxModelRunner:
             max(mlx_usable - mlx_used, 0),
             int(sys_available * self._mem_fraction_static),
         )
-        if self._cache_layout.has_auxiliary_state and not self.disable_radix_cache:
-            ratio = get_schedule().mamba_full_memory_ratio
-            self._aux_state_budget_bytes = int(kv_budget * ratio / (1 + ratio))
-            kv_budget -= self._aux_state_budget_bytes
         bytes_per_slot = 2 * num_layers * n_kv_heads * head_dim * dtype.size
+        if hybrid_radix:
+            snapshot_bytes, live_kv_bytes = self._measure_request_footprint()
+            live_reserve = int(mlx_limit * _LIVE_REQUEST_RESERVE_FRACTION)
+            kv_budget = max(kv_budget - live_reserve, 0)
+            explicit_slots = get_schedule().max_mamba_cache_size
+            if explicit_slots is not None:
+                aux_budget = (
+                    explicit_slots // get_parallel().attn_dp_size
+                ) * snapshot_bytes
+            else:
+                ratio = get_schedule().mamba_full_memory_ratio
+                aux_budget = int(kv_budget * ratio / (1 + ratio))
+            slots = max(aux_budget // max(snapshot_bytes, 1), MIN_AUX_STATE_SLOTS)
+            if aux_budget // max(snapshot_bytes, 1) < MIN_AUX_STATE_SLOTS:
+                logger.warning(
+                    "The auxiliary-state budget (%.2f GiB) backs fewer than %d "
+                    "snapshots of %.1f MB; the pool keeps %d slots.",
+                    aux_budget / 1024**3,
+                    MIN_AUX_STATE_SLOTS,
+                    snapshot_bytes / 1e6,
+                    MIN_AUX_STATE_SLOTS,
+                )
+            kv_budget = max(kv_budget - aux_budget, 0)
+            self._aux_state_budget_bytes = aux_budget
+            self._snapshot_bytes = snapshot_bytes
+            # A running request holds a live and a tracked snapshot slot and its
+            # KV cache: bound the running requests by the reserve and by the slots.
+            self.max_live_requests = max(
+                1, min(live_reserve // max(live_kv_bytes, 1), slots // 2)
+            )
+        if explicit_size is not None:
+            return explicit_size
         pool_size = max(kv_budget // bytes_per_slot, 256)
         logger.info(
             f"Auto-sized attention KV pool: "
-            f"aux_state_budget={(self._aux_state_budget_bytes or 0) / (1024**3):.2f} GB, "
-            f"sys_available={sys_available / (1024**3):.2f} GB, "
-            f"mlx_limit={mlx_limit / (1024**3):.1f} GB, "
-            f"mlx_used={mlx_used / (1024**3):.2f} GB, "
-            f"kv_budget={kv_budget / (1024**3):.2f} GB, "
+            f"aux_state_budget={(self._aux_state_budget_bytes or 0) / (1024**3):.2f} GiB, "
+            f"max_live_requests={self.max_live_requests}, "
+            f"sys_available={sys_available / (1024**3):.2f} GiB, "
+            f"mlx_limit={mlx_limit / (1024**3):.1f} GiB, "
+            f"mlx_used={mlx_used / (1024**3):.2f} GiB, "
+            f"kv_budget={kv_budget / (1024**3):.2f} GiB, "
             f"bytes_per_slot={bytes_per_slot}, pool_size={pool_size}"
         )
         return pool_size
@@ -743,7 +810,9 @@ class MlxModelRunner:
             return
         aux_pool = self._get_auxiliary_state_pool()
         if aux_pool is not None and self._aux_state_budget_bytes is not None:
-            aux_pool.set_memory_budget(self._aux_state_budget_bytes)
+            aux_pool.set_memory_budget(
+                self._aux_state_budget_bytes, self._snapshot_bytes
+            )
         num_pool_layers = self._cache_layout.num_full_attention_layers
         if self._cache_layout.has_sliding_window_layers:
             # Allocating it anyway would burn the whole auto-sized KV budget
