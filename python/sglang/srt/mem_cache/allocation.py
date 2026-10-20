@@ -301,7 +301,12 @@ def ensure_mamba_capacity(
     tree_cache: BasePrefixCache | None,
 ) -> bool:
     """Reclaim the Mamba slots needed before binding any request rows."""
-    if not isinstance(req_to_token_pool, HybridReqToTokenPool):
+    # The MLX auxiliary-state pool is not a HybridReqToTokenPool but binds one
+    # slot per request the same way (it declares no extra tracking slots), and
+    # its radix-held snapshots have to be evicted before the pool runs dry.
+    if not isinstance(req_to_token_pool, HybridReqToTokenPool) and not hasattr(
+        req_to_token_pool, "auxiliary_state_pool"
+    ):
         return True
 
     # Count the slots HybridReqToTokenPool.alloc will allocate for each request.

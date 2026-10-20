@@ -77,6 +77,7 @@ from sglang.srt.hardware_backend.mlx.sampling import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import (
+    get_schedule,
     mamba_cache_chunk_size,
 )
 
@@ -666,7 +667,17 @@ class MlxModelRunner:
         return first_config
 
     def _compute_pool_size(self, explicit_size: int | None) -> int:
-        """Determine pool slot count (auto-size from available memory if needed)."""
+        """Determine pool slot count (auto-size from available memory if needed).
+
+        A model with auxiliary (GDN/mamba) state and the radix cache on also keeps
+        one state snapshot per cached prefix. Those snapshots are real device
+        memory, so the budget is split between the KV pool and them with the
+        server's ``mamba_full_memory_ratio`` (as CUDA does) and the share left
+        for snapshots is handed to the auxiliary-state pool in
+        ``init_cache_pools``; otherwise the KV pool takes the whole budget and
+        the snapshots run the device out of memory.
+        """
+        self._aux_state_budget_bytes: int | None = None
         if explicit_size is not None:
             return explicit_size
         n_kv_heads, head_dim, dtype = self._get_attn_config()
@@ -688,10 +699,15 @@ class MlxModelRunner:
             max(mlx_usable - mlx_used, 0),
             int(sys_available * self._mem_fraction_static),
         )
+        if self._cache_layout.has_auxiliary_state and not self.disable_radix_cache:
+            ratio = get_schedule().mamba_full_memory_ratio
+            self._aux_state_budget_bytes = int(kv_budget * ratio / (1 + ratio))
+            kv_budget -= self._aux_state_budget_bytes
         bytes_per_slot = 2 * num_layers * n_kv_heads * head_dim * dtype.size
         pool_size = max(kv_budget // bytes_per_slot, 256)
         logger.info(
             f"Auto-sized attention KV pool: "
+            f"aux_state_budget={(self._aux_state_budget_bytes or 0) / (1024**3):.2f} GB, "
             f"sys_available={sys_available / (1024**3):.2f} GB, "
             f"mlx_limit={mlx_limit / (1024**3):.1f} GB, "
             f"mlx_used={mlx_used / (1024**3):.2f} GB, "
@@ -725,6 +741,9 @@ class MlxModelRunner:
         self._req_to_token_pool = req_to_token_pool
         if self.disable_radix_cache:
             return
+        aux_pool = self._get_auxiliary_state_pool()
+        if aux_pool is not None and self._aux_state_budget_bytes is not None:
+            aux_pool.set_memory_budget(self._aux_state_budget_bytes)
         num_pool_layers = self._cache_layout.num_full_attention_layers
         if self._cache_layout.has_sliding_window_layers:
             # Allocating it anyway would burn the whole auto-sized KV budget
@@ -838,6 +857,11 @@ class MlxModelRunner:
             ]
         )
         self._attention_kv_pool.set_kv_all_layers(slot_ids_mx, k_all, v_all)
+        # The scatters are lazy and chain on the previous buffer versions: left
+        # unevaluated they keep every request's slice of its contiguous KV cache
+        # (4096-token chunks, ~130 MB per request on a 4B hybrid) alive, which on
+        # a long run is the device out of memory. Evaluating drops them.
+        mx.eval(*self._attention_kv_pool.all_buffers())
 
     def _sync_decode_kv_to_pool(self, req_id: str, end: int | None = None) -> None:
         """Sync un-flushed decode KV for *req_id* to the shared pool, up to
