@@ -787,8 +787,8 @@ ChatCompletionMessageParam = Union[
 class Function(BaseModel):
     """Function descriptions."""
 
-    name: str
     description: Optional[str] = Field(default=None, examples=[None])
+    name: str
     parameters: Optional[object] = None
     strict: bool = False
     defer_loading: Optional[bool] = None
@@ -815,14 +815,24 @@ class Tool(BaseModel):
         return self
 
     def to_template_dict(self) -> dict:
-        """The tool as the client sent it, for the chat template.
+        """The tool for the chat template, in the OpenAI schema's key order.
 
         Templates render ``tools`` verbatim (``{{ tool | tojson }}``), so a field
-        the client never set (``strict: false``, ``defer_loading: null``) would
-        add tokens the model was not shown by any other engine and shift greedy
-        decoding. Only what was set is rendered, and ``Function`` declares
-        ``name`` first, the order of the OpenAI schema."""
-        return self.model_dump(exclude_unset=True)
+        the client never set (``strict: false``, ``defer_loading: null``) adds
+        tokens that no other engine shows the model and shifts greedy decoding.
+        Only fields that were set and are not null are rendered, ``name`` before
+        ``description`` as in the OpenAI schema. ``Function``'s own field order
+        (and so ``model_dump()``, which other consumers read) is unchanged."""
+        data = self.model_dump(exclude_unset=True)
+        function = data.get("function", {})
+        ordered = {
+            key: function[key]
+            for key in ("name", "description", "parameters", "strict", "defer_loading")
+            if function.get(key) is not None
+        }
+        ordered.update({k: v for k, v in function.items() if k not in ordered})
+        data["function"] = ordered
+        return {k: v for k, v in data.items() if v is not None}
 
 
 # Tool is defined after the message params that reference it, so the forward
