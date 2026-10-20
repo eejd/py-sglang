@@ -77,13 +77,20 @@ class MambaComponent(TreeComponent):
                 f"MambaComponent requires page_size=1 when mamba_extra_buffer is disabled, got {params.page_size}"
             )
         super().__init__(cache, params)
+        self._init_mamba_settings(params)
+        # HiCache state
+        self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
+
+    def _init_mamba_settings(self, params: CacheInitParams) -> None:
+        """The checkpoint geometry and per-path cap that the match, insert and
+        evict paths read. A subclass that does not call ``__init__`` (the MLX
+        auxiliary-state component, whose pool is not a ``HybridReqToTokenPool``)
+        calls this instead, so a setting added here reaches it too."""
         self.mamba_cache_chunk_size = mamba_cache_chunk_size()
         # params.page_size is the tree page the allocator actually uses, already
         # widened by dcp_size, so it is the one grid a checkpoint depth can land on.
         self.mamba_checkpoint_grid = mamba_checkpoint_grid(params.page_size)
         self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
-        # HiCache state
-        self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
 
     def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
         data = node.component_data[self.component_type]

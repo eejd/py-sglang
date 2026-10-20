@@ -41,6 +41,16 @@ if _HAS_MLX:
     from sglang.srt.hardware_backend.mlx.model_runner_stub import (
         MlxModelRunnerStub,
     )
+    from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+
+
+def _component_params():
+    """No_buffer cache-init params, with the server args the component's
+    checkpoint geometry reads published (production has both)."""
+    server_args = ServerArgs(model_path="dummy", page_size=1)
+    server_args._mamba_cache_chunk_size = 64
+    set_global_server_args_for_scheduler(server_args)
+    return SimpleNamespace(enable_mamba_extra_buffer=False, page_size=1)
 
 
 def _arch(hybrid):
@@ -280,7 +290,7 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
         pool = stub.req_to_token_pool
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
-            SimpleNamespace(enable_mamba_extra_buffer=False),
+            _component_params(),
         )
         aux_capacity = pool.auxiliary_state_pool.available_size()
         for _ in range(3 * aux_capacity):

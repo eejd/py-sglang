@@ -2985,6 +2985,81 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         )
 
+    def test_mamba_radix_cache_resolution_on_mlx_never_picks_extra_buffer(self):
+        """MlxAuxiliaryStateComponent rejects extra_buffer, so on the MLX backend
+        `auto` resolves to no_buffer (with overlap off, which no_buffer needs) for
+        the architectures that would otherwise get extra_buffer, and an explicit
+        extra_buffer is refused by the validator naming no_buffer."""
+        from sglang.srt.arg_groups.mamba_hook import validate_mamba_extra_buffer
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _mamba_radix_cache_resolution,
+            supports_mamba_cache_extra_buffer,
+        )
+
+        def _view(arch, **kw):
+            defaults = dict(
+                disable_radix_cache=False,
+                mamba_radix_cache_strategy="auto",
+                disable_overlap_schedule=False,
+                page_size=None,
+                linear_attn_backend="triton",
+                linear_attn_prefill_backend=None,
+            )
+            defaults.update(kw)
+            return ResolvedView(
+                SimpleNamespace(
+                    _model_config=SimpleNamespace(
+                        hf_config=SimpleNamespace(architectures=[arch])
+                    ),
+                    **defaults,
+                )
+            )
+
+        no_buffer = {
+            "uses_mamba_radix_cache": True,
+            "mamba_radix_cache_strategy": "no_buffer",
+            "disable_overlap_schedule": True,
+        }
+        for architecture in (
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3NextForCausalLM",
+            "NemotronHForCausalLM",
+        ):
+            with self.subTest(architecture=architecture):
+                with patch.object(overrides_module, "use_mlx", return_value=True):
+                    self.assertEqual(
+                        _mamba_radix_cache_resolution(_view(architecture)), no_buffer
+                    )
+                    # paging alone wants the extra buffer elsewhere; MLX still cannot
+                    self.assertEqual(
+                        _mamba_radix_cache_resolution(
+                            _view(
+                                architecture, disable_overlap_schedule=True, page_size=64
+                            )
+                        ),
+                        no_buffer,
+                    )
+                    with self.assertRaisesRegex(AssertionError, "use no_buffer"):
+                        validate_mamba_extra_buffer(
+                            SimpleNamespace(
+                                linear_attn_backend="triton",
+                                mamba_radix_cache_strategy="extra_buffer",
+                                speculative_num_draft_tokens=None,
+                                page_size=None,
+                            ),
+                            SimpleNamespace(architectures=[architecture]),
+                            mamba_cache_chunk_size_of=lambda: 64,
+                        )
+                # the same architecture off MLX is unchanged
+                with patch.object(overrides_module, "use_mlx", return_value=False):
+                    self.assertTrue(
+                        supports_mamba_cache_extra_buffer(
+                            SimpleNamespace(linear_attn_backend="triton"),
+                            SimpleNamespace(architectures=[architecture]),
+                        )
+                    )
+
     def test_mamba_radix_cache_resolution_reads_registry_specs(self):
         """A spec registered by config predicate (archs=[]) drives the leaves
         exactly like an arch-registered one, and the spec's

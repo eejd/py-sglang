@@ -60,6 +60,7 @@ from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_
 
 logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import (
     attn_dp_enabled_of,
@@ -440,7 +441,10 @@ def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
     the configured linear-attention backend (pure read)."""
     from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
 
-    if get_platform().is_xpu:
+    # The MLX backend snapshots the sequence-end state only
+    # (MlxAuxiliaryStateComponent rejects extra_buffer), so `auto` must resolve
+    # to no_buffer there and an explicit extra_buffer is refused by name.
+    if get_platform().is_xpu or use_mlx():
         return False
     spec = get_linear_attn_spec(hf_config)
     if hf_config.architectures[0] in _MAMBA_EXTRA_BUFFER_ARCHS or (

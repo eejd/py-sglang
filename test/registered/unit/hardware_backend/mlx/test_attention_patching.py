@@ -94,6 +94,13 @@ def _set_dummy_server_args_for_auxiliary_state_tests() -> None:
     set_global_server_args_for_scheduler(server_args)
 
 
+def _auxiliary_state_component_params() -> SimpleNamespace:
+    """The cache-init params of a no_buffer tree, with the server args the
+    component's checkpoint geometry reads published (production has both)."""
+    _set_dummy_server_args_for_auxiliary_state_tests()
+    return SimpleNamespace(enable_mamba_extra_buffer=False, page_size=1)
+
+
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
 class TestMlxAttentionPatching(unittest.TestCase):
     def test_standard_attention_is_patched_once(self):
@@ -968,7 +975,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         req.kv.mamba_last_track_seqlen = 64
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
-            SimpleNamespace(enable_mamba_extra_buffer=False),
+            _auxiliary_state_component_params(),
         )
         insert_params = InsertParams()
 
@@ -993,6 +1000,45 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertIsNone(req.kv.mamba_last_track_seqlen)
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
 
+    def test_auxiliary_state_component_names_the_branching_checkpoint(self):
+        # The component does not run MambaComponent.__init__ (its pool is not a
+        # HybridReqToTokenPool), so the checkpoint geometry the unified tree's
+        # match path reads has to be set by the shared settings helper.
+        from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType
+
+        pool = MlxAuxiliaryStateReqToTokenPool(
+            size=2,
+            max_context_len=8,
+            device="cpu",
+            enable_memory_saver=False,
+            auxiliary_state_size=4,
+        )
+        component = MlxAuxiliaryStateComponent(
+            SimpleNamespace(req_to_token_pool=pool),
+            _auxiliary_state_component_params(),
+        )
+        node = SimpleNamespace(
+            component_data={
+                ComponentType.MAMBA: SimpleNamespace(value=None, host_value=None)
+            }
+        )
+        match = MatchResult(
+            device_prefix_len=0,
+            last_device_node=node,
+            last_host_node=node,
+            best_match_node=node,
+            full_kv_hit_length=200,
+        )
+
+        result = component.finalize_match_result_in_tree_core(
+            match, SimpleNamespace(), [], 0
+        )
+
+        self.assertEqual(component.mamba_checkpoint_grid, 64)
+        # 200 tokens of Full KV: the last 64-aligned depth inside it is 192.
+        self.assertEqual(result.mamba_branching_seqlen, 192)
+
     def test_auxiliary_state_component_unfinished_frees_tracked_source_slot(self):
         pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
@@ -1008,7 +1054,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         req.kv.mamba_last_track_seqlen = 64
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
-            SimpleNamespace(enable_mamba_extra_buffer=False),
+            _auxiliary_state_component_params(),
         )
         insert_params = InsertParams()
 
@@ -1048,7 +1094,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         req.kv.mamba_next_track_idx = 0
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
-            SimpleNamespace(enable_mamba_extra_buffer=False),
+            _auxiliary_state_component_params(),
         )
         insert_params = InsertParams()
 
@@ -1085,7 +1131,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         pool.alloc([req])
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
-            SimpleNamespace(enable_mamba_extra_buffer=False),
+            _auxiliary_state_component_params(),
         )
         insert_params = InsertParams()
 
