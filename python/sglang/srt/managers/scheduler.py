@@ -439,6 +439,33 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 
+def mlx_logprob_refusal(
+    *, return_logprob: bool, logprob_start_len: int, input_len: int
+) -> Optional[str]:
+    """Why the MLX path cannot serve this request's logprobs, or None.
+
+    Only the sampling path (``--mlx-enable-sampling``) produces logprobs, and
+    only for the output tokens. Without it the worker returns none, and output
+    processing of a request that asked for them crashed the scheduler.
+    """
+    if not return_logprob or not use_mlx():
+        return None
+    if not get_device().mlx_enable_sampling:
+        return (
+            "logprobs on the MLX backend require --mlx-enable-sampling: without "
+            "it the MLX path returns no logprobs"
+        )
+    if 0 <= logprob_start_len < input_len:
+        # The prefill result carries no input_token_logprobs, so letting this
+        # through would crash output processing.
+        return (
+            "Prompt input logprobs (logprob_start_len) are not supported "
+            "on the MLX sampling path; omit logprob_start_len to get "
+            "output logprobs."
+        )
+    return None
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -3215,19 +3242,11 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if (
-            get_device().mlx_enable_sampling
-            and req.return_logprob
-            and 0 <= req.logprob_start_len < len(req.origin_input_ids)
+        if error_msg := mlx_logprob_refusal(
+            return_logprob=req.return_logprob,
+            logprob_start_len=req.logprob_start_len,
+            input_len=len(req.origin_input_ids),
         ):
-            # The MLX sampling path computes output logprobs only; the
-            # prefill result carries no input_token_logprobs, so letting
-            # this through would crash output processing.
-            error_msg = (
-                "Prompt input logprobs (logprob_start_len) are not supported "
-                "on the MLX sampling path; omit logprob_start_len to get "
-                "output logprobs."
-            )
             req.logprob_start_len = -1
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
