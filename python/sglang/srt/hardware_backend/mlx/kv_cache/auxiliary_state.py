@@ -42,7 +42,8 @@ def _clone_tree(value: Any) -> Any:
     return value
 
 
-def _arrays_in_tree(value: Any) -> list[mx.array]:
+def arrays_in_tree(value: Any) -> list[mx.array]:
+    """Every array of a nested list / tuple / dict, in order."""
     # No self-referencing closure here: a nested ``collect`` that calls itself is a
     # reference cycle (function <-> its cell), so every call left its list of
     # arrays -- the state of a snapshot -- alive until the cyclic garbage collector
@@ -66,7 +67,7 @@ def cache_state_nbytes(cache: list[Any], layer_indices: Iterable[int]) -> int:
     return sum(
         array.nbytes
         for layer_idx in layer_indices
-        for array in _arrays_in_tree(
+        for array in arrays_in_tree(
             (
                 getattr(cache[layer_idx], "state", ()),
                 getattr(cache[layer_idx], "meta_state", ()),
@@ -93,7 +94,7 @@ def _snapshot_cache(cache: Any) -> _CacheSnapshot:
         for name in _CACHE_ATTRS
         if hasattr(cache, name)
     }
-    arrays = _arrays_in_tree((state, meta_state, attrs))
+    arrays = arrays_in_tree((state, meta_state, attrs))
     if arrays:
         mx.eval(*arrays)
     return _CacheSnapshot(state=state, meta_state=meta_state, attrs=attrs)

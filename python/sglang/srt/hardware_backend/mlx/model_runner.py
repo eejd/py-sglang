@@ -60,6 +60,7 @@ from sglang.srt.hardware_backend.mlx.kv_cache import (
 )
 from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
     MIN_AUX_STATE_SLOTS,
+    arrays_in_tree,
     cache_state_nbytes,
 )
 from sglang.srt.hardware_backend.mlx.remote_code_gate import (
@@ -506,22 +507,7 @@ class MlxModelRunner:
     @staticmethod
     def _cache_arrays(cache: Any) -> list[mx.array]:
         """Return every MLX array nested under ``cache.state``."""
-        arrays: list[mx.array] = []
-
-        def collect(value: Any) -> None:
-            if isinstance(value, mx.array):
-                arrays.append(value)
-            elif value is None:
-                return
-            elif isinstance(value, (list, tuple)):
-                for item in value:
-                    collect(item)
-            elif isinstance(value, dict):
-                for item in value.values():
-                    collect(item)
-
-        collect(getattr(cache, "state", ()))
-        return arrays
+        return arrays_in_tree(getattr(cache, "state", ()))
 
     @staticmethod
     def cache_state_arrays(caches: list[list[Any]]) -> list[mx.array]:
@@ -766,15 +752,12 @@ class MlxModelRunner:
         133k-token prompt killed the previous sizing at 54.6 GB, which gave the
         leftover of the token bound to the snapshots.
 
-        NOT covered: many concurrent requests that reuse a cached prefix
+        NOT covered here: many concurrent requests that reuse a cached prefix
         (py-sglang#15). The token bound counts the pool's unique tokens, but a
         request that hits the radix tree gathers its prefix into a PRIVATE
         contiguous cache (``_materialize_pool_backed_attention``), so N requests
         sharing a P-token prefix cost the pool P tokens once and N x capacity(P)
-        bytes in caches. On a snapshot-saturated Qwen3.5-4B engine 24 concurrent
-        32k-token hits and 8 concurrent 131k-token hits exhausted the working set;
-        1 to 16 concurrent 32k hits, 4 x 60k, 16 x 16k, 16 x 8k and repeated
-        prompts completed (see the PR for the measured peaks).
+        bytes in caches; this sizing does not bound that.
         """
         self._aux_state_budget_bytes: int | None = None
         self._snapshot_bytes: int | None = None
