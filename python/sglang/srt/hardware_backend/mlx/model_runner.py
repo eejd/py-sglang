@@ -816,7 +816,6 @@ class MlxModelRunner:
             token_cap = (free * 3 // 4) // (4 * bytes_per_slot)
             self._aux_state_budget_bytes = aux_budget
             self._snapshot_bytes = snapshot_bytes
-            kv_budget = free
             logger.info(
                 "Per-request footprint: snapshot %.1f MB, live attention KV %.1f MB; "
                 "%.2f GiB beside the snapshots for the KV pool and running requests: "
@@ -853,7 +852,10 @@ class MlxModelRunner:
                 )
             self._finish_aux_budget()
             return explicit_size
-        pool_size = max(kv_budget // bytes_per_slot, 256)
+        # What the KV pool may take: with snapshots reserved it is the rest of the
+        # budget (then cut to the live-token bound below), else the whole budget.
+        pool_budget = free if hybrid_radix else kv_budget
+        pool_size = max(pool_budget // bytes_per_slot, 256)
         if token_cap is not None and pool_size > token_cap:
             pool_size = max(token_cap, 256)
         self._finish_aux_budget()
