@@ -834,6 +834,68 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
         self.assertEqual(runner.model.seen_inputs, [[[11, 12, 13]]])
 
+    def test_two_requests_hitting_one_snapshot_each_get_their_own_copy(self):
+        # Requests of one batch that matched the same tree node share the copy source
+        # (py-sglang#14: 16 x 32k hits on one prefix).
+        runner, tree_slot, first = self._hit_runner()
+        pool = runner._req_to_token_pool
+        second = FakeRequest()
+        pool.alloc([second])
+        batch = SimpleNamespace(
+            mamba_cow_src_indices=torch.cat([tree_slot, tree_slot]),
+            mamba_cow_dst_indices=torch.stack(
+                [first.kv.mamba_pool_idx, second.kv.mamba_pool_idx]
+            ).reshape(-1),
+        )
+
+        self._worker_for(runner)._execute_deferred_auxiliary_state_cow(batch)
+        for rid, req in (("r0", first), ("r1", second)):
+            pending = runner.prefill_start(
+                req_id=rid,
+                new_token_ids=[13],
+                full_token_ids=[11, 12, 13],
+                prefix_slot_ids=[2, 3],
+                new_slot_ids=[4],
+                req_pool_idx=req.kv.req_pool_idx,
+            )
+            runner.eval_pending(pending)
+            runner.prefill_finalize(pending)
+
+        # both restored: only their suffix ran, from the shared snapshot's state
+        self.assertEqual(runner.model.seen_inputs, [[[13]], [[13]]])
+        self.assertEqual(runner.model.seen_auxiliary_states, [[42.0], [42.0]])
+        # three distinct slots, and the tree's snapshot is untouched
+        owned = {int(first.kv.mamba_pool_idx), int(second.kv.mamba_pool_idx)}
+        self.assertEqual(len(owned | {int(tree_slot[0])}), 3)
+        tree_copy = [FakeNativeCache(), None]
+        pool.auxiliary_state_pool.restore_cache(tree_slot[0], tree_copy, [0])
+        self.assertEqual(tree_copy[0].state[0].tolist(), [42.0])
+
+    def test_a_restored_hit_with_no_new_tokens_runs_the_whole_prompt(self):
+        # The state at the match boundary cannot produce the last token's logits, so
+        # a hit that covers the whole prompt re-runs the prompt even when its state
+        # was restored.
+        runner, tree_slot, req = self._hit_runner()
+        batch = SimpleNamespace(
+            mamba_cow_src_indices=tree_slot,
+            mamba_cow_dst_indices=req.kv.mamba_pool_idx.unsqueeze(0),
+        )
+        self._worker_for(runner)._execute_deferred_auxiliary_state_cow(batch)
+
+        pending = runner.prefill_start(
+            req_id="r0",
+            new_token_ids=[],
+            full_token_ids=[11, 12, 13],
+            prefix_slot_ids=[2, 3, 4],
+            new_slot_ids=[],
+            req_pool_idx=req.kv.req_pool_idx,
+        )
+        runner.eval_pending(pending)
+        runner.prefill_finalize(pending)
+
+        self.assertEqual(runner.model.seen_inputs, [[[11, 12, 13]]])
+        self.assertEqual(runner._req_token_ids["r0"][:3], [11, 12, 13])
+
     def test_the_copy_is_skipped_when_the_batch_matched_nothing(self):
         runner, _, _ = self._hit_runner()
         worker = self._worker_for(runner)
