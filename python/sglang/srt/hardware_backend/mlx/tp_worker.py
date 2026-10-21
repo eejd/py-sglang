@@ -116,6 +116,7 @@ class MlxTpModelWorker(TpModelWorker):
             memory_pool_config=self.memory_pool_config,
             mlx_pool_size=self._mlx_runner.pool_size,
             mlx_max_live_requests=self._mlx_runner.max_live_requests,
+            mlx_aux_state_slots=self._mlx_runner.aux_state_slots,
         )
 
         self._mlx_active_rids: set[str] = set()

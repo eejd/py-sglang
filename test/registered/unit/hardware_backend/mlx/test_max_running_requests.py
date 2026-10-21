@@ -279,6 +279,19 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
         self.assertEqual(stub.max_running_requests, 3)
         self.assertEqual(stub.req_to_token_pool.auxiliary_state_pool.size, 3)
 
+    def test_aux_pool_has_the_slots_the_memory_budget_backs(self):
+        # The runner measured how many snapshots the budget holds: the pool gets
+        # them, not max_running_requests x ratio (which the live clamp made tiny).
+        stub = _hybrid_stub_for_initialize(
+            max_running_requests=2, max_mamba_cache_size=None
+        )
+        stub._mlx_aux_state_slots = 50
+        stub._mlx_max_live_requests = 2
+        with _arch(hybrid=True), _published(stub):
+            stub.initialize()
+        self.assertEqual(stub.max_running_requests, 2)
+        self.assertEqual(stub.req_to_token_pool.auxiliary_state_pool.size, 50)
+
     def test_radix_disabled_sequential_requests_release_their_aux_slot(self):
         # With radix disabled the component cleanup still frees the slot on finish;
         # sequential requests far past the pool size must get every slot back.

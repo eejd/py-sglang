@@ -713,6 +713,7 @@ class MlxModelRunner:
         self._aux_state_budget_bytes: int | None = None
         self._snapshot_bytes: int | None = None
         self.max_live_requests: int | None = None
+        self.aux_state_slots: int | None = None
         hybrid_radix = (
             self._cache_layout.has_auxiliary_state and not self.disable_radix_cache
         )
@@ -762,6 +763,14 @@ class MlxModelRunner:
                 )
             kv_budget = max(kv_budget - aux_budget, 0)
             self._aux_state_budget_bytes = aux_budget
+            self.aux_state_slots = slots
+            logger.info(
+                "Per-request footprint: snapshot %.1f MB, live attention KV %.1f MB; "
+                "%d snapshot slots",
+                snapshot_bytes / 1e6,
+                live_kv_bytes / 1e6,
+                slots,
+            )
             self._snapshot_bytes = snapshot_bytes
             # A running request holds a live and a tracked snapshot slot and its
             # KV cache: bound the running requests by the reserve and by the slots.

@@ -139,17 +139,20 @@ class MlxModelRunnerStub(ModelRunner):
 
     # Set by the worker from the runner's device-memory budget of running requests.
     _mlx_max_live_requests: int | None = None
+    _mlx_aux_state_slots: int | None = None
 
     def __init__(
         self,
         *args,
         mlx_pool_size: int | None = None,
         mlx_max_live_requests: int | None = None,
+        mlx_aux_state_slots: int | None = None,
         **kwargs,
     ):
         self.validate_startup_weight_load_mode()
         self._mlx_pool_size = mlx_pool_size
         self._mlx_max_live_requests = mlx_max_live_requests
+        self._mlx_aux_state_slots = mlx_aux_state_slots
         super().__init__(*args, **kwargs)
 
     def load_model(self):
@@ -310,6 +313,9 @@ class MlxModelRunnerStub(ModelRunner):
         # Create minimal pools
         if mambaish_config(self.model_config) is not None:
             auxiliary_state_size = self._explicit_aux_state_size_per_worker()
+            if auxiliary_state_size is None and self._mlx_aux_state_slots is not None:
+                # The slots the device-memory budget backs (measured snapshot size).
+                auxiliary_state_size = self._mlx_aux_state_slots
             if auxiliary_state_size is None:
                 auxiliary_state_size = (
                     self.max_running_requests * self._aux_state_slots_per_request()
