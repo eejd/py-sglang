@@ -852,12 +852,12 @@ class MlxModelRunner:
                 )
             self._finish_aux_budget()
             return explicit_size
-        # What the KV pool may take: with snapshots reserved it is the rest of the
-        # budget (then cut to the live-token bound below), else the whole budget.
-        pool_budget = free if hybrid_radix else kv_budget
-        pool_size = max(pool_budget // bytes_per_slot, 256)
-        if token_cap is not None and pool_size > token_cap:
+        # With snapshots reserved the pool is the live-token bound, which is a share
+        # of what the snapshots leave (``free``); else it is the whole budget.
+        if token_cap is not None:
             pool_size = max(token_cap, 256)
+        else:
+            pool_size = max(kv_budget // bytes_per_slot, 256)
         self._finish_aux_budget()
         logger.info(
             f"Auto-sized attention KV pool: "
