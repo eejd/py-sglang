@@ -6,6 +6,7 @@ import importlib.util
 import unittest
 from collections import deque
 from types import SimpleNamespace
+from unittest import mock
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.runtime_context import reset_context
@@ -744,6 +745,146 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             req.kv.mamba_pool_idx, restored, [0]
         )
         self.assertEqual(restored[0].state[0].tolist(), [1.0])
+
+    def _hit_runner(self):
+        """A runner over the fake hybrid model with a pool that holds a tree
+        snapshot (42.0) in slot ``tree_slot`` and a request owning ``req``."""
+        runner = object.__new__(MlxModelRunner)
+        runner.model = FakeAuxiliaryStateModel()
+        _set_runner_cache_layout(runner, num_layers=2, attention_layer_indices=[1])
+        runner._max_seq_len = 8
+        runner._cache_pool = []
+        runner._trunk = None
+        runner.disable_radix_cache = False
+        runner._attention_kv_pool = MlxAttentionKVPool(
+            pool_size=8, num_layers=1, n_kv_heads=1, head_dim=2, dtype=mx.float32
+        )
+        runner._req_to_token_pool = MlxAuxiliaryStateReqToTokenPool(
+            size=2,
+            max_context_len=8,
+            device="cpu",
+            enable_memory_saver=False,
+            auxiliary_state_size=4,
+        )
+        runner._req_caches = {}
+        runner._req_token_ids = {}
+        runner._req_pool_idx = {}
+        runner._req_synced_offset = {}
+        pool = runner._req_to_token_pool
+        tree_slot = pool.auxiliary_state_pool.alloc(1)
+        pool.auxiliary_state_pool.store_cache(
+            tree_slot[0],
+            [FakeNativeCache(mx.array([42.0], dtype=mx.float32)), None],
+            [0],
+        )
+        req = FakeRequest()
+        pool.alloc([req])
+        return runner, tree_slot, req
+
+    def _worker_for(self, runner):
+        from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
+
+        worker = object.__new__(MlxTpModelWorker)
+        worker._model_runner = SimpleNamespace(
+            req_to_token_pool=runner._req_to_token_pool
+        )
+        return worker
+
+    def _hit(self, runner, req):
+        pending = runner.prefill_start(
+            req_id="r0",
+            new_token_ids=[13],
+            full_token_ids=[11, 12, 13],
+            prefix_slot_ids=[2, 3],
+            new_slot_ids=[4],
+            req_pool_idx=req.kv.req_pool_idx,
+        )
+        runner.eval_pending(pending)
+        runner.prefill_finalize(pending)
+
+    def test_a_prefix_hit_restores_the_state_the_worker_copies_to_the_request_slot(
+        self,
+    ):
+        # The scheduler defers the copy-on-write of the matched tree snapshot to the
+        # forward; the MLX worker has to perform it or the hit finds its own slot
+        # empty and re-runs the whole prompt (py-sglang#13).
+        runner, tree_slot, req = self._hit_runner()
+        batch = SimpleNamespace(
+            mamba_cow_src_indices=tree_slot,
+            mamba_cow_dst_indices=req.kv.mamba_pool_idx.unsqueeze(0),
+        )
+
+        self._worker_for(runner)._execute_deferred_auxiliary_state_cow(batch)
+        self._hit(runner, req)
+
+        # only the suffix ran, from the restored state
+        self.assertEqual(runner.model.seen_inputs, [[[13]]])
+        self.assertEqual(runner.model.seen_auxiliary_states, [[42.0]])
+        # the request's slot is its own copy: the tree's snapshot is untouched
+        tree_copy = [FakeNativeCache(), None]
+        runner._req_to_token_pool.auxiliary_state_pool.restore_cache(
+            tree_slot[0], tree_copy, [0]
+        )
+        self.assertEqual(tree_copy[0].state[0].tolist(), [42.0])
+
+    def test_a_hit_without_the_copy_runs_the_whole_prompt(self):
+        runner, _, req = self._hit_runner()
+
+        self._hit(runner, req)
+
+        self.assertEqual(runner.model.seen_inputs, [[[11, 12, 13]]])
+
+    def test_the_copy_is_skipped_when_the_batch_matched_nothing(self):
+        runner, _, _ = self._hit_runner()
+        worker = self._worker_for(runner)
+
+        worker._execute_deferred_auxiliary_state_cow(
+            SimpleNamespace(mamba_cow_src_indices=None, mamba_cow_dst_indices=None)
+        )
+        worker._execute_deferred_auxiliary_state_cow(
+            SimpleNamespace(
+                mamba_cow_src_indices=torch.empty(0, dtype=torch.int64),
+                mamba_cow_dst_indices=torch.empty(0, dtype=torch.int64),
+            )
+        )
+
+    def test_a_prompt_that_cannot_restore_its_prefix_runs_in_chunks(self):
+        runner, _, _ = self._hit_runner()
+        cache = runner._acquire_cache()
+        evaluated = []
+        real_eval = mx.eval
+
+        def recording_eval(*arrays):
+            evaluated.append(len(arrays))
+            return real_eval(*arrays)
+
+        with (
+            mock.patch("sglang.srt.hardware_backend.mlx.model_runner._PROMPT_CHUNK", 4),
+            mock.patch(
+                "sglang.srt.hardware_backend.mlx.model_runner.mx.eval", recording_eval
+            ),
+        ):
+            runner._forward_prompt_lazy_token(
+                list(range(10)), cache, needs_logits=False, req_id="r0"
+            )
+
+        # one forward per piece, not one over the whole prompt; every piece but
+        # the last is evaluated before the next starts
+        self.assertEqual([len(x[0]) for x in runner.model.seen_inputs], [4, 4, 2])
+        self.assertEqual(len(evaluated), 2)
+
+    def test_a_prompt_of_exactly_one_piece_is_not_split(self):
+        runner, _, _ = self._hit_runner()
+        cache = runner._acquire_cache()
+
+        with mock.patch(
+            "sglang.srt.hardware_backend.mlx.model_runner._PROMPT_CHUNK", 4
+        ):
+            runner._forward_prompt_lazy_token(
+                list(range(4)), cache, needs_logits=False, req_id="r0"
+            )
+
+        self.assertEqual([len(x[0]) for x in runner.model.seen_inputs], [4])
 
     def test_auxiliary_state_prefill_tracks_chunk_aligned_auxiliary_state(self):
         _set_dummy_server_args_for_auxiliary_state_tests()
