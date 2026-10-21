@@ -93,6 +93,9 @@ logger = logging.getLogger(__name__)
 # running request against 185.7 MB measured (snapshot state + first KV chunk), x1.10;
 # 1.25 leaves margin over that.
 _LIVE_REQUEST_SLACK = 1.25
+# Below these the reserve (a high --mem-fraction-static) makes the engine awkward to use.
+_MIN_COMFORTABLE_REQUESTS = 8
+_MIN_COMFORTABLE_TOKENS = 65536
 
 
 @dataclass
@@ -711,10 +714,22 @@ class MlxModelRunner:
           KV pool always could); the headroom ``(1 - mem_fraction_static)`` of the
           working set is the reserve for the running requests;
         * half of the reserve backs the per-request fixed footprint (snapshot-sized
-          live state + first KV chunk, x ``_LIVE_REQUEST_SLACK``), which bounds
+          live state + the first KV chunk, x ``_LIVE_REQUEST_SLACK``), which bounds
           ``max_live_requests``; the other half backs KV growth beyond the first
-          chunk, which bounds the token pool (``max_total_num_tokens``) because every
-          live token also sits in a request's contiguous cache;
+          chunk, and the live-token bound (``max_total_num_tokens``) is the
+          reserve over the doubling worst case, ``reserve / (2 x bytes per
+          token)``: a request's contiguous cache starts at ``_max_seq_len`` tokens
+          and doubles, so its capacity is below twice its tokens, and every live
+          token is also held there. This is a bound, not a proof: a cache that has
+          just doubled holds the old and the new buffer, and 20 requests each at
+          ``2^k + 1`` tokens with a saturated snapshot pool can still exceed the
+          reserve by up to ``max_live_requests x _max_seq_len`` tokens' bytes. No
+          measured run reached it (saturated pool + 16 x 16k, 8 x 32k and one 128k
+          request peaked at 49.9 GB of a 55.6 GB working set). A higher
+          ``--mem-fraction-static`` shrinks the reserve, and with it
+          ``max_running_requests`` and ``max_total_num_tokens`` (0.95: about
+          6 requests / 46k tokens on a 64 GB host; 0.99: 1 request / 8k), a
+          startup warning says so;
         * the committed budget is split between KV pool and snapshots with
           ``mamba_full_memory_ratio`` (as CUDA does), or an explicit
           ``--max-mamba-cache-size`` times the measured snapshot size; what the
@@ -758,7 +773,6 @@ class MlxModelRunner:
             snapshot_bytes, live_kv_bytes = self._measure_request_footprint()
             reserve = max(mlx_limit - mlx_usable, 0)
             reserve_fixed = reserve // 2
-            reserve_growth = reserve - reserve_fixed
             per_request = int((snapshot_bytes + live_kv_bytes) * _LIVE_REQUEST_SLACK)
             explicit_slots = get_schedule().max_mamba_cache_size
             if explicit_slots is not None:
@@ -789,9 +803,7 @@ class MlxModelRunner:
                     max(slots, MIN_AUX_STATE_SLOTS) // 2,
                 ),
             )
-            token_cap = self.max_live_requests * self._max_seq_len + reserve_growth // (
-                2 * bytes_per_slot
-            )
+            token_cap = reserve // (2 * bytes_per_slot)
             self._aux_state_budget_bytes = aux_budget
             self._snapshot_bytes = snapshot_bytes
             kv_budget -= aux_budget
@@ -801,6 +813,19 @@ class MlxModelRunner:
                 "max_live_requests=%d, live-token bound %d",
                 snapshot_bytes / 1e6,
                 live_kv_bytes / 1e6,
+                reserve / 1024**3,
+                self.max_live_requests,
+                token_cap,
+            )
+        if token_cap is not None and (
+            token_cap < _MIN_COMFORTABLE_TOKENS
+            or self.max_live_requests < _MIN_COMFORTABLE_REQUESTS
+        ):
+            logger.warning(
+                "mem_fraction_static=%.3f leaves a %.2f GiB reserve for running "
+                "requests: at most %d running requests and %d live tokens. Lower "
+                "--mem-fraction-static to serve more or longer requests.",
+                self._mem_fraction_static,
                 reserve / 1024**3,
                 self.max_live_requests,
                 token_cap,
@@ -828,7 +853,7 @@ class MlxModelRunner:
             f"sys_available={sys_available / (1024**3):.2f} GiB, "
             f"mlx_limit={mlx_limit / (1024**3):.1f} GiB, "
             f"mlx_used={mlx_used / (1024**3):.2f} GiB, "
-            f"kv_budget={kv_budget / (1024**3):.2f} GiB, "
+            f"kv_pool={pool_size * bytes_per_slot / (1024**3):.2f} GiB, "
             f"bytes_per_slot={bytes_per_slot}, pool_size={pool_size}"
         )
         return pool_size

@@ -178,9 +178,9 @@ class TestRunnerBudget(unittest.TestCase):
         # working set 50 GiB, mem_fraction_static 0.8: 10 GiB reserve, half for the
         # fixed per-request footprint: (50 + 128) MiB x 1.25 = 222.5 MiB -> 23
         self.assertEqual(hybrid.max_live_requests, 23)
-        # the other half bounds the live tokens: 23 x 4096 first chunks plus
-        # 5 GiB / (2 x 32768 B), and the KV pool is cut to it
-        self.assertEqual(hybrid_slots, 23 * 4096 + 5 * self.GIB // (2 * 32768))
+        # the live tokens are bounded by the reserve over the doubling worst case:
+        # 10 GiB / (2 x 32768 B), and the KV pool is cut to it
+        self.assertEqual(hybrid_slots, 10 * self.GIB // (2 * 32768))
         self.assertLess(hybrid_slots, plain_slots)
         # the KV share the bound leaves goes to the snapshots (above the 0.9/1.9 split)
         split = int(40 * self.GIB * 0.9 / 1.9)
@@ -191,6 +191,29 @@ class TestRunnerBudget(unittest.TestCase):
         self.assertEqual(
             hybrid.aux_state_slots, hybrid._aux_state_budget_bytes // (50 * MIB)
         )
+
+    def test_a_high_mem_fraction_static_warns_that_it_shrinks_the_engine(self):
+        runner = self._runner()
+        runner._mem_fraction_static = 0.95
+
+        with self.assertLogs(
+            "sglang.srt.hardware_backend.mlx.model_runner", level="WARNING"
+        ) as logs:
+            slots = self._size(runner)
+
+        # 2.5 GiB reserve: 5 requests, 20480 live tokens
+        self.assertEqual(runner.max_live_requests, 5)
+        self.assertEqual(slots, int(2.5 * self.GIB) // (2 * 32768))
+        self.assertIn("--mem-fraction-static", logs.output[0])
+
+    def test_the_default_fraction_does_not_warn(self):
+        runner = self._runner()
+        runner._mem_fraction_static = 0.6  # 20 GiB reserve
+
+        with self.assertNoLogs(
+            "sglang.srt.hardware_backend.mlx.model_runner", level="WARNING"
+        ):
+            self._size(runner)
 
     def test_a_lower_mem_fraction_static_leaves_more_reserve_and_more_requests(self):
         low = self._runner()
@@ -239,7 +262,9 @@ class TestRunnerBudget(unittest.TestCase):
         ) as logs:
             self._size(runner)
 
-        self.assertIn(f"keeps {MIN_AUX_STATE_SLOTS} slots", logs.output[0])
+        self.assertTrue(
+            any(f"keeps {MIN_AUX_STATE_SLOTS} slots" in line for line in logs.output)
+        )
         self.assertEqual(runner.aux_state_slots, MIN_AUX_STATE_SLOTS)
         self.assertEqual(runner.max_live_requests, 1)
 
