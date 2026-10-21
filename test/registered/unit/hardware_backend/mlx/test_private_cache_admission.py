@@ -239,25 +239,42 @@ class TestRunnerPrivateCacheAccounting(unittest.TestCase):
         )
         runner._req_caches = {}
         runner._prefill_caches = {}
+        runner._req_pool_idx = {}
         return runner
 
     def _cache(self, capacity):
         return [ContiguousAttentionKVCache(max_seq_len=capacity)]
 
+    def _run(self, runner, rid, capacity):
+        runner._req_caches[rid] = self._cache(capacity)
+        runner._req_pool_idx[rid] = 0
+
     def test_running_and_unfinalised_requests_both_count(self):
         runner = self._runner()
-        runner._req_caches["running"] = self._cache(32_768)
+        self._run(runner, "running", 32_768)
         runner._prefill_caches["launched"] = self._cache(65_536)
 
         self.assertEqual(runner.private_cache_tokens_in_use(), 98_304)
 
+    def test_a_finished_request_does_not_count(self):
+        # Its row is released (no pool index): it never runs again, and its cache
+        # waits for the next launch. Counting it deadlocked an idle engine: the
+        # next request was refused on the memory of one that was gone.
+        runner = self._runner()
+        self._run(runner, "running", 4096)
+        runner._req_caches["finished"] = self._cache(262_144)
+
+        self.assertEqual(runner.private_cache_tokens_in_use(), 4096)
+        self.assertEqual(runner.released_request_ids(), {"finished"})
+
     def test_a_cache_that_grew_counts_its_new_capacity(self):
         runner = self._runner()
-        cache = self._cache(4096)
-        runner._req_caches["r"] = cache
+        self._run(runner, "r", 4096)
         before = runner.private_cache_tokens_in_use()
 
-        cache[0].update_and_fetch(mx.zeros((1, 1, 5000, 2)), mx.zeros((1, 1, 5000, 2)))
+        runner._req_caches["r"][0].update_and_fetch(
+            mx.zeros((1, 1, 5000, 2)), mx.zeros((1, 1, 5000, 2))
+        )
 
         self.assertEqual((before, runner.private_cache_tokens_in_use()), (4096, 8192))
 
@@ -265,10 +282,9 @@ class TestRunnerPrivateCacheAccounting(unittest.TestCase):
         runner = self._runner()
         runner._req_token_ids = {}
         runner._req_sampling = {}
-        runner._req_pool_idx = {}
         runner._req_synced_offset = {}
         runner._cache_pool = []
-        runner._req_caches["r"] = self._cache(32_768)
+        self._run(runner, "r", 32_768)
         runner._prefill_caches["r"] = self._cache(32_768)
 
         runner.remove_request("r")

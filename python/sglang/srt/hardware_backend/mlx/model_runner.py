@@ -340,11 +340,24 @@ class MlxModelRunner:
         if not self._cache_layout.has_auxiliary_state:
             self._cache_pool.append(cache)
 
+    def released_request_ids(self) -> set[str]:
+        """Finished requests: the scheduler released their row (``release_request_
+        row``), they never run again, and their state waits for the next launch to
+        free it."""
+        return {rid for rid in self._req_caches if rid not in self._req_pool_idx}
+
     def private_cache_tokens_in_use(self) -> int:
-        """Capacity tokens of the private attention caches of every request that
-        holds one (running, and prefills launched but not finalised)."""
+        """Capacity tokens of the private attention caches of the requests that
+        run (or whose prefill is launched but not finalised). A finished request's
+        cache is not counted: the next launch frees it, and an idle engine would
+        otherwise refuse a request on the memory of one that is gone."""
+        running = [
+            cache
+            for rid, cache in self._req_caches.items()
+            if rid in self._req_pool_idx
+        ]
         total = 0
-        for cache in (*self._req_caches.values(), *self._prefill_caches.values()):
+        for cache in (*running, *self._prefill_caches.values()):
             attention = self._first_attention_cache(cache)
             total += getattr(attention, "max_seq_len", 0)
         return total
