@@ -58,6 +58,11 @@ from sglang.srt.hardware_backend.mlx.kv_cache import (
     set_context,
     uses_sliding_window_attention,
 )
+from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
+    MIN_AUX_STATE_SLOTS,
+    arrays_in_tree,
+    cache_state_nbytes,
+)
 from sglang.srt.hardware_backend.mlx.remote_code_gate import (
     ensure_remote_code_allowed,
     resolve_model_directory,
@@ -77,10 +82,21 @@ from sglang.srt.hardware_backend.mlx.sampling import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import (
+    get_parallel,
+    get_schedule,
     mamba_cache_chunk_size,
 )
 
 logger = logging.getLogger(__name__)
+
+# Slack on a running request's measured device footprint (activations, allocator
+# rounding): the 256-request burst of Qwen3.5-4B (py-sglang#11) peaked 205 MB per
+# running request against 185.7 MB measured (snapshot state + first KV chunk), x1.10;
+# 1.25 leaves margin over that.
+_LIVE_REQUEST_SLACK = 1.25
+# Below these the budget beside the snapshots leaves the engine awkward to use.
+_MIN_COMFORTABLE_REQUESTS = 8
+_MIN_COMFORTABLE_TOKENS = 65536
 
 
 @dataclass
@@ -461,22 +477,7 @@ class MlxModelRunner:
     @staticmethod
     def _cache_arrays(cache: Any) -> list[mx.array]:
         """Return every MLX array nested under ``cache.state``."""
-        arrays: list[mx.array] = []
-
-        def collect(value: Any) -> None:
-            if isinstance(value, mx.array):
-                arrays.append(value)
-            elif value is None:
-                return
-            elif isinstance(value, (list, tuple)):
-                for item in value:
-                    collect(item)
-            elif isinstance(value, dict):
-                for item in value.values():
-                    collect(item)
-
-        collect(getattr(cache, "state", ()))
-        return arrays
+        return arrays_in_tree(getattr(cache, "state", ()))
 
     @staticmethod
     def cache_state_arrays(caches: list[list[Any]]) -> list[mx.array]:
@@ -665,9 +666,81 @@ class MlxModelRunner:
                 )
         return first_config
 
+    def _measure_request_footprint(self) -> tuple[int, int]:
+        """Measure what one request holds on the device, by running one token
+        through a fresh native cache: ``(snapshot_bytes, live_kv_bytes)``, the
+        auxiliary-state snapshot and the preallocated per-request attention KV."""
+        cache = self._new_native_cache()
+        self.model(mx.array([[0]], dtype=mx.int32), cache=cache)
+        arrays = [
+            a
+            for c in cache
+            for a in (getattr(c, "keys", None), getattr(c, "values", None))
+            if a is not None
+        ]
+        mx.eval(*arrays, *[getattr(c, "state", ()) for c in cache if c is not None])
+        snapshot_bytes = cache_state_nbytes(
+            cache, self._cache_layout.auxiliary_layer_indices
+        )
+        live_kv_bytes = sum(a.nbytes for a in arrays)
+        del cache, arrays
+        mx.clear_cache()
+        return snapshot_bytes, live_kv_bytes
+
     def _compute_pool_size(self, explicit_size: int | None) -> int:
-        """Determine pool slot count (auto-size from available memory if needed)."""
-        if explicit_size is not None:
+        """Determine pool slot count (auto-size from available memory if needed).
+
+        A model with auxiliary (GDN/mamba) state and the radix cache on also
+        keeps one state snapshot per cached prefix, and every running request
+        holds its own live state and preallocated attention KV (a contiguous cache
+        that starts at ``_max_seq_len`` tokens and doubles). All of it is device
+        memory. The budget ``mem_fraction_static x working set - weights`` is
+        split:
+
+        * the snapshots get ``mamba_full_memory_ratio / (1 + ratio)`` of it (as on
+          CUDA), or an explicit ``--max-mamba-cache-size`` times the measured
+          snapshot size; the pool never holds more, so a snapshot-dense radix
+          tree cannot grow past it;
+        * the rest, ``free``, is for the KV pool and the running requests: a
+          quarter of it backs the per-request fixed footprint (snapshot-sized live
+          state + the first KV chunk, x ``_LIVE_REQUEST_SLACK``), which bounds
+          ``max_live_requests``; three quarters back the live tokens, each costing
+          the pool's bytes once (the pool) plus up to three times in the
+          request's contiguous cache (capacity below twice its tokens, and a cache
+          that is growing holds the old and the new buffer: 1.5 x capacity), so
+          ``max_total_num_tokens = 3/4 x free / (4 x bytes per token)``.
+          Every live token also occupies the shared token pool, so live tokens
+          evict radix tokens and the snapshots hanging off them;
+        * what ``mem_fraction_static`` does not commit stays free headroom for
+          activations and the allocator.
+
+        Worst case for DISTINCT prompts on Qwen3.5-4B (51.8 GiB working set,
+        defaults): 402 snapshots (20.7 GB) + one request of 131073 tokens
+        (capacity 262144 = 8.6 GB, 12.9 GB while growing) + the KV pool + 23 short
+        requests with their live states + weights is about 45 GB of 55.6 GB. A
+        snapshot-dense saturation (756 single-chunk prompts) followed by a
+        133k-token prompt killed the previous sizing at 54.6 GB, which gave the
+        leftover of the token bound to the snapshots.
+
+        NOT covered: requests that reuse a cached prefix. The token bound counts
+        the pool's unique tokens, but a request that hits the radix tree gathers
+        its prefix into a PRIVATE contiguous cache (``_materialize_pool_backed_
+        attention``), so N requests sharing a P-token prefix cost the pool P tokens
+        once and N x capacity(P) bytes in caches; and the prefix-hit prefill itself
+        peaks far above that: one request with a 28.7k-token cached prefix and a
+        3.4k-token suffix peaked 30 GB above an idle engine, which an engine
+        saturated with snapshots (28 GB) cannot take (py-sglang#13). Partial hits
+        on long prefixes are therefore unsafe with the radix cache on; whole-prompt
+        repeats and distinct prompts are measured safe.
+        """
+        self._aux_state_budget_bytes: int | None = None
+        self._snapshot_bytes: int | None = None
+        self.max_live_requests: int | None = None
+        self.aux_state_slots: int | None = None
+        hybrid_radix = (
+            self._cache_layout.has_auxiliary_state and not self.disable_radix_cache
+        )
+        if explicit_size is not None and not hybrid_radix:
             return explicit_size
         n_kv_heads, head_dim, dtype = self._get_attn_config()
         # Only full-attention layers occupy pool slots. All-SWA models have no
@@ -689,16 +762,114 @@ class MlxModelRunner:
             int(sys_available * self._mem_fraction_static),
         )
         bytes_per_slot = 2 * num_layers * n_kv_heads * head_dim * dtype.size
-        pool_size = max(kv_budget // bytes_per_slot, 256)
+        token_cap: int | None = None
+        free = 0
+        if hybrid_radix:
+            snapshot_bytes, live_kv_bytes = self._measure_request_footprint()
+            per_request = int((snapshot_bytes + live_kv_bytes) * _LIVE_REQUEST_SLACK)
+            explicit_slots = get_schedule().max_mamba_cache_size
+            if explicit_slots is not None:
+                aux_budget = (
+                    explicit_slots // get_parallel().attn_dp_size
+                ) * snapshot_bytes
+                if (
+                    explicit_size is None
+                    and aux_budget > kv_budget - 256 * bytes_per_slot
+                ):
+                    raise ValueError(
+                        f"--max-mamba-cache-size {explicit_slots} needs "
+                        f"{aux_budget / 1024**3:.2f} GiB of snapshots "
+                        f"({snapshot_bytes / 1e6:.1f} MB each) but the device budget "
+                        f"is {kv_budget / 1024**3:.2f} GiB, which leaves no KV pool. "
+                        "Lower it or raise --mem-fraction-static."
+                    )
+            else:
+                ratio = get_schedule().mamba_full_memory_ratio
+                aux_budget = int(kv_budget * ratio / (1 + ratio))
+            free = max(kv_budget - aux_budget, 0)
+            slots = aux_budget // max(snapshot_bytes, 1)
+            # A running request holds a live and a tracked snapshot slot and its
+            # KV cache: bound the running requests by the budget and by the slots.
+            self.max_live_requests = max(
+                1,
+                min(
+                    (free // 4) // max(per_request, 1),
+                    max(slots, MIN_AUX_STATE_SLOTS) // 2,
+                ),
+            )
+            token_cap = (free * 3 // 4) // (4 * bytes_per_slot)
+            self._aux_state_budget_bytes = aux_budget
+            self._snapshot_bytes = snapshot_bytes
+            logger.info(
+                "Per-request footprint: snapshot %.1f MB, live attention KV %.1f MB; "
+                "%.2f GiB beside the snapshots for the KV pool and running requests: "
+                "max_live_requests=%d, live-token bound %d",
+                snapshot_bytes / 1e6,
+                live_kv_bytes / 1e6,
+                free / 1024**3,
+                self.max_live_requests,
+                token_cap,
+            )
+        if token_cap is not None and (
+            token_cap < _MIN_COMFORTABLE_TOKENS
+            or self.max_live_requests < _MIN_COMFORTABLE_REQUESTS
+        ):
+            logger.warning(
+                "The device budget leaves %.2f GiB beside the snapshots for the KV "
+                "pool and the running requests (mem_fraction_static=%.3f): at most "
+                "%d running requests and %d live tokens. Raise --mem-fraction-static "
+                "or lower --max-mamba-cache-size / --mamba-full-memory-ratio to "
+                "serve more or longer requests.",
+                free / 1024**3,
+                self._mem_fraction_static,
+                self.max_live_requests,
+                token_cap,
+            )
+        if explicit_size is not None:
+            if token_cap is not None and explicit_size > token_cap:
+                logger.warning(
+                    "--max-total-tokens %d exceeds the %d live tokens the device "
+                    "budget backs (each live token is also held in a request's "
+                    "contiguous cache); long-context concurrency is unbounded.",
+                    explicit_size,
+                    token_cap,
+                )
+            self._finish_aux_budget()
+            return explicit_size
+        # With snapshots reserved the pool is the live-token bound, which is a share
+        # of what the snapshots leave (``free``); else it is the whole budget.
+        if token_cap is not None:
+            pool_size = max(token_cap, 256)
+        else:
+            pool_size = max(kv_budget // bytes_per_slot, 256)
+        self._finish_aux_budget()
         logger.info(
             f"Auto-sized attention KV pool: "
-            f"sys_available={sys_available / (1024**3):.2f} GB, "
-            f"mlx_limit={mlx_limit / (1024**3):.1f} GB, "
-            f"mlx_used={mlx_used / (1024**3):.2f} GB, "
-            f"kv_budget={kv_budget / (1024**3):.2f} GB, "
+            f"aux_state_budget={(self._aux_state_budget_bytes or 0) / (1024**3):.2f} GiB, "
+            f"max_live_requests={self.max_live_requests}, "
+            f"sys_available={sys_available / (1024**3):.2f} GiB, "
+            f"mlx_limit={mlx_limit / (1024**3):.1f} GiB, "
+            f"mlx_used={mlx_used / (1024**3):.2f} GiB, "
+            f"kv_pool={pool_size * bytes_per_slot / (1024**3):.2f} GiB, "
             f"bytes_per_slot={bytes_per_slot}, pool_size={pool_size}"
         )
         return pool_size
+
+    def _finish_aux_budget(self) -> None:
+        """Turn the snapshot budget into slots (with the floor)."""
+        if self._aux_state_budget_bytes is None:
+            return
+        backed = self._aux_state_budget_bytes // max(self._snapshot_bytes, 1)
+        if backed < MIN_AUX_STATE_SLOTS:
+            logger.warning(
+                "The auxiliary-state budget (%.2f GiB) backs fewer than %d "
+                "snapshots of %.1f MB; the pool keeps %d slots.",
+                self._aux_state_budget_bytes / 1024**3,
+                MIN_AUX_STATE_SLOTS,
+                self._snapshot_bytes / 1e6,
+                MIN_AUX_STATE_SLOTS,
+            )
+        self.aux_state_slots = max(backed, MIN_AUX_STATE_SLOTS)
 
     @property
     def pool_size(self) -> int:
@@ -725,6 +896,11 @@ class MlxModelRunner:
         self._req_to_token_pool = req_to_token_pool
         if self.disable_radix_cache:
             return
+        aux_pool = self._get_auxiliary_state_pool()
+        if aux_pool is not None and self._aux_state_budget_bytes is not None:
+            aux_pool.set_memory_budget(
+                self._aux_state_budget_bytes, self._snapshot_bytes
+            )
         num_pool_layers = self._cache_layout.num_full_attention_layers
         if self._cache_layout.has_sliding_window_layers:
             # Allocating it anyway would burn the whole auto-sized KV budget
@@ -838,6 +1014,16 @@ class MlxModelRunner:
             ]
         )
         self._attention_kv_pool.set_kv_all_layers(slot_ids_mx, k_all, v_all)
+        # The scatters are lazy and chain on the previous buffer versions, each
+        # holding the slice of the request's contiguous KV cache it copies from.
+        # A model with auxiliary state gets a new cache per request (_acquire_cache
+        # reuses caches only for models without it), so unevaluated the chain
+        # keeps every request's cache alive (~130 MB each on Qwen3.5-4B: the device
+        # out of memory after ~140 requests, py-sglang#11). Evaluating drops them.
+        # Dense models reuse their caches (flat memory over 500 distinct requests
+        # measured without it) and are spared the eval, which costs prefill latency.
+        if self._cache_layout.has_auxiliary_state:
+            mx.eval(*self._attention_kv_pool.all_buffers())
 
     def _sync_decode_kv_to_pool(self, req_id: str, end: int | None = None) -> None:
         """Sync un-flushed decode KV for *req_id* to the shared pool, up to

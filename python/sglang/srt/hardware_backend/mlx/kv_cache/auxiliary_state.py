@@ -9,6 +9,7 @@ storing model-agnostic native cache snapshots.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Iterable, Iterator, Optional
 
@@ -22,6 +23,9 @@ from sglang.srt.mem_cache.unified_cache.components.mamba import (
     MambaComponent,
 )
 
+logger = logging.getLogger(__name__)
+
+MIN_AUX_STATE_SLOTS = 8
 _CACHE_ATTRS = ("offset", "lengths", "left_padding")
 _MISSING = object()
 
@@ -38,21 +42,39 @@ def _clone_tree(value: Any) -> Any:
     return value
 
 
-def _arrays_in_tree(value: Any) -> list[mx.array]:
+def arrays_in_tree(value: Any) -> list[mx.array]:
+    """Every array of a nested list / tuple / dict, in order."""
+    # No self-referencing closure here: a nested ``collect`` that calls itself is a
+    # reference cycle (function <-> its cell), so every call left its list of
+    # arrays -- the state of a snapshot -- alive until the cyclic garbage collector
+    # ran, which does not know about device memory. Evicting a snapshot then freed
+    # nothing, and a burst of long requests ran the device out of memory.
     arrays: list[mx.array] = []
-
-    def collect(item: Any) -> None:
+    pending = [value]
+    while pending:
+        item = pending.pop()
         if isinstance(item, mx.array):
             arrays.append(item)
         elif isinstance(item, (list, tuple)):
-            for child in item:
-                collect(child)
+            pending.extend(reversed(item))
         elif isinstance(item, dict):
-            for child in item.values():
-                collect(child)
-
-    collect(value)
+            pending.extend(reversed(list(item.values())))
     return arrays
+
+
+def cache_state_nbytes(cache: list[Any], layer_indices: Iterable[int]) -> int:
+    """Device bytes of the state a snapshot of *layer_indices* of *cache* holds."""
+    return sum(
+        array.nbytes
+        for layer_idx in layer_indices
+        for array in arrays_in_tree(
+            (
+                getattr(cache[layer_idx], "state", ()),
+                getattr(cache[layer_idx], "meta_state", ()),
+                [getattr(cache[layer_idx], name, None) for name in _CACHE_ATTRS],
+            )
+        )
+    )
 
 
 @dataclass
@@ -72,7 +94,7 @@ def _snapshot_cache(cache: Any) -> _CacheSnapshot:
         for name in _CACHE_ATTRS
         if hasattr(cache, name)
     }
-    arrays = _arrays_in_tree((state, meta_state, attrs))
+    arrays = arrays_in_tree((state, meta_state, attrs))
     if arrays:
         mx.eval(*arrays)
     return _CacheSnapshot(state=state, meta_state=meta_state, attrs=attrs)
@@ -94,6 +116,10 @@ class MlxAuxiliaryStatePool:
         self.device = device
         self.mamba_cache = None
         self.mem_usage = 0
+        # Device-memory budget for snapshots (set_memory_budget). Slots are cheap
+        # bookkeeping; the snapshots behind them are not.
+        self._memory_budget_bytes: Optional[int] = None
+        self._snapshot_bytes = 0
         self._snapshots: dict[int, dict[int, _CacheSnapshot]] = {}
         self._alloc_iter: Optional[Iterator[torch.Tensor]] = None
         self.clear()
@@ -105,6 +131,30 @@ class MlxAuxiliaryStatePool:
         flat = self._tensor(index)
         assert flat.numel() == 1
         return int(flat.item())
+
+    def set_memory_budget(self, budget_bytes: int, snapshot_bytes: int) -> None:
+        """Bound the snapshots held (live requests and the radix tree) to
+        *budget_bytes* of device memory, one snapshot being *snapshot_bytes*.
+
+        Shrinks the pool to the slots that fit (never below the highest slot in
+        use, nor below ``MIN_AUX_STATE_SLOTS``). ``size`` is what the scheduler's
+        pool-invariant check counts against, so the pool itself shrinks instead
+        of hiding free slots."""
+        self._memory_budget_bytes = budget_bytes
+        self._snapshot_bytes = snapshot_bytes
+        cap = max(budget_bytes // max(snapshot_bytes, 1), MIN_AUX_STATE_SLOTS)
+        if cap >= self.size:
+            return
+        in_use = set(range(1, self.size + 1)) - set(self.free_slots.tolist())
+        new_size = max(cap, max(in_use, default=0))
+        self.free_slots = self.free_slots[self.free_slots <= new_size]
+        self.size = new_size
+        logger.info(
+            "MLX auxiliary-state pool: %d slots of %.1f MB (budget %.2f GiB)",
+            new_size,
+            snapshot_bytes / 1e6,
+            budget_bytes / 1024**3,
+        )
 
     def available_size(self) -> int:
         return int(self.free_slots.numel())
@@ -243,6 +293,10 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
         # Keep the MLX-owned name beside it so local code can avoid model-
         # specific terminology.
         self.auxiliary_state_pool = self.mamba_pool
+        # Declares one extra slot per request, the tracked (mid-prompt) snapshot
+        # the runner takes next to the live one; ensure_mamba_capacity counts it
+        # and reclaims radix-held snapshots for both before the request binds.
+        self.mamba_initial_tracking_slots = 1
         self.enable_mamba_extra_buffer = False
         self.req_index_to_auxiliary_state_index_mapping = torch.zeros(
             self._alloc_size, dtype=torch.int32, device=device

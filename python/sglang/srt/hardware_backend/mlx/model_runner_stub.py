@@ -137,9 +137,22 @@ class MlxModelRunnerStub(ModelRunner):
                 "--startup-weight-load-mode=overlap is not supported: CUDA only"
             )
 
-    def __init__(self, *args, mlx_pool_size: int | None = None, **kwargs):
+    # Set by the worker from the runner's device-memory budget of running requests.
+    _mlx_max_live_requests: int | None = None
+    _mlx_aux_state_slots: int | None = None
+
+    def __init__(
+        self,
+        *args,
+        mlx_pool_size: int | None = None,
+        mlx_max_live_requests: int | None = None,
+        mlx_aux_state_slots: int | None = None,
+        **kwargs,
+    ):
         self.validate_startup_weight_load_mode()
         self._mlx_pool_size = mlx_pool_size
+        self._mlx_max_live_requests = mlx_max_live_requests
+        self._mlx_aux_state_slots = mlx_aux_state_slots
         super().__init__(*args, **kwargs)
 
     def load_model(self):
@@ -212,6 +225,20 @@ class MlxModelRunnerStub(ModelRunner):
         else:
             requested_per_worker = max(1, requested // get_parallel().attn_dp_size)
             resolved = min(requested_per_worker, capacity_cap)
+
+        if (
+            self._mlx_max_live_requests is not None
+            and resolved > self._mlx_max_live_requests
+        ):
+            # The device-memory budget of the running requests (their KV and
+            # auxiliary-state slots) backs this many; more would exhaust it.
+            logger.info(
+                "max_running_requests bounded to %d by the device-memory budget "
+                "of the running requests (was %d).",
+                self._mlx_max_live_requests,
+                resolved,
+            )
+            resolved = self._mlx_max_live_requests
 
         aux_state_size = self._explicit_aux_state_size_per_worker()
         if (
@@ -286,6 +313,9 @@ class MlxModelRunnerStub(ModelRunner):
         # Create minimal pools
         if mambaish_config(self.model_config) is not None:
             auxiliary_state_size = self._explicit_aux_state_size_per_worker()
+            if auxiliary_state_size is None and self._mlx_aux_state_slots is not None:
+                # The slots the device-memory budget backs (measured snapshot size).
+                auxiliary_state_size = self._mlx_aux_state_slots
             if auxiliary_state_size is None:
                 auxiliary_state_size = (
                     self.max_running_requests * self._aux_state_slots_per_request()
