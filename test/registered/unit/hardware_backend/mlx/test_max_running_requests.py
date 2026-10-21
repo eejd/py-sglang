@@ -413,13 +413,15 @@ class TestMlxStubModelContext(CustomTestCase):
         self.assertTrue(stub._kernel_warmed_up)
 
     def test_the_stub_model_has_no_shared_experts(self):
+        from sglang.srt.configs.shared_experts import SharedExpertsConfig
+
         stub = self._stub_with_loaded_model()
 
         config = stub.model.shared_experts_config
 
-        self.assertEqual(
-            (config.fusion_disabled, config.num_fused_shared_experts), (False, 0)
-        )
+        # every field at its default: no fused shared experts, fusion not disabled,
+        # no waterfill (the loader yields exactly this for a model without them)
+        self.assertEqual(config, SharedExpertsConfig())
         self.assertEqual(config.num_shared_topk_slots, 0)
 
 
