@@ -830,6 +830,32 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         self.assertEqual(tree_copy[0].state[0].tolist(), [42.0])
 
+    def test_a_prefill_counts_against_the_private_cache_bound_until_its_row_is_released(
+        self,
+    ):
+        # launched (not finalised), running, then finished: the admission bound
+        # must count the cache of the first two and not the last (py-sglang#15)
+        runner, _, req = self._hit_runner()
+        pending = runner.prefill_start(
+            req_id="r0",
+            new_token_ids=[11, 12, 13],
+            full_token_ids=[11, 12, 13],
+            prefix_slot_ids=[],
+            new_slot_ids=[2, 3, 4],
+            req_pool_idx=req.kv.req_pool_idx,
+        )
+        launched = runner.private_cache_tokens_in_use()
+        runner.eval_pending(pending)
+        runner.prefill_finalize(pending)
+        running = runner.private_cache_tokens_in_use()
+
+        runner.release_request_row("r0", owned_len=3)
+
+        self.assertEqual((launched, running), (8, 8))
+        self.assertEqual(runner.private_cache_tokens_in_use(), 0)
+        self.assertEqual(runner._prefill_caches, {})
+        self.assertEqual(runner.released_request_ids(), {"r0"})
+
     def test_a_hit_without_the_copy_runs_the_whole_prompt(self):
         runner, _, req = self._hit_runner()
 
