@@ -60,6 +60,7 @@ from sglang.srt.hardware_backend.mlx.kv_cache import (
 )
 from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
     MIN_AUX_STATE_SLOTS,
+    arrays_in_tree,
     cache_state_nbytes,
 )
 from sglang.srt.hardware_backend.mlx.remote_code_gate import (
@@ -478,22 +479,7 @@ class MlxModelRunner:
     @staticmethod
     def _cache_arrays(cache: Any) -> list[mx.array]:
         """Return every MLX array nested under ``cache.state``."""
-        arrays: list[mx.array] = []
-
-        def collect(value: Any) -> None:
-            if isinstance(value, mx.array):
-                arrays.append(value)
-            elif value is None:
-                return
-            elif isinstance(value, (list, tuple)):
-                for item in value:
-                    collect(item)
-            elif isinstance(value, dict):
-                for item in value.values():
-                    collect(item)
-
-        collect(getattr(cache, "state", ()))
-        return arrays
+        return arrays_in_tree(getattr(cache, "state", ()))
 
     @staticmethod
     def cache_state_arrays(caches: list[list[Any]]) -> list[mx.array]:

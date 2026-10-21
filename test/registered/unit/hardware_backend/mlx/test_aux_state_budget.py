@@ -163,14 +163,29 @@ class TestSnapshotsFreeTheirMemoryWithoutTheCollector(unittest.TestCase):
 
         self.assertEqual(self._gc.collect(), 0)
 
+    def test_the_runners_cache_state_arrays_leave_no_cyclic_garbage(self):
+        # called for every request at every step: each call that left a cycle kept
+        # the request's whole contiguous KV cache alive (~2 GB at 65536 tokens)
+        class _Layer:
+            state = [mx.zeros((4, 4)), (mx.zeros((2,)), {"k": mx.zeros((3,))})]
+
+        caches = [[_Layer(), None]]
+        self._gc.collect()
+
+        for _ in range(20):
+            found = MlxModelRunner.cache_state_arrays(caches)
+
+        self.assertEqual(len(found), 3)
+        self.assertEqual(self._gc.collect(), 0)
+
     def test_arrays_in_tree_finds_every_array_of_a_nested_state_in_order(self):
         from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
-            _arrays_in_tree,
+            arrays_in_tree,
         )
 
         a, b, c, d = (mx.array([i]) for i in range(4))
 
-        found = _arrays_in_tree(([a, (b, 3)], {"k": c, "j": [d]}, "text", None))
+        found = arrays_in_tree(([a, (b, 3)], {"k": c, "j": [d]}, "text", None))
 
         self.assertEqual([x.item() for x in found], [0, 1, 2, 3])
 
