@@ -93,7 +93,7 @@ logger = logging.getLogger(__name__)
 # running request against 185.7 MB measured (snapshot state + first KV chunk), x1.10;
 # 1.25 leaves margin over that.
 _LIVE_REQUEST_SLACK = 1.25
-# Below these the reserve (a high --mem-fraction-static) makes the engine awkward to use.
+# Below these the budget beside the snapshots leaves the engine awkward to use.
 _MIN_COMFORTABLE_REQUESTS = 8
 _MIN_COMFORTABLE_TOKENS = 65536
 
@@ -707,36 +707,34 @@ class MlxModelRunner:
         A model with auxiliary (GDN/mamba) state and the radix cache on also
         keeps one state snapshot per cached prefix, and every running request
         holds its own live state and preallocated attention KV (a contiguous cache
-        that starts at ``_max_seq_len`` tokens and doubles, 2x the pool's per-token
-        bytes at worst). All of it is device memory, so:
+        that starts at ``_max_seq_len`` tokens and doubles). All of it is device
+        memory. The budget ``mem_fraction_static x working set - weights`` is
+        split:
 
-        * the pools may commit ``mem_fraction_static`` of the working set (as the
-          KV pool always could); the headroom ``(1 - mem_fraction_static)`` of the
-          working set is the reserve for the running requests;
-        * half of the reserve backs the per-request fixed footprint (snapshot-sized
-          live state + the first KV chunk, x ``_LIVE_REQUEST_SLACK``), which bounds
-          ``max_live_requests``; the other half backs KV growth beyond the first
-          chunk, and the live-token bound (``max_total_num_tokens``) is the
-          reserve over the doubling worst case, ``reserve / (2 x bytes per
-          token)``: a request's contiguous cache starts at ``_max_seq_len`` tokens
-          and doubles, so its capacity is below twice its tokens, and every live
-          token is also held there. This is a bound, not a proof: a cache that has
-          just doubled holds the old and the new buffer, and 20 requests each at
-          ``2^k + 1`` tokens with a saturated snapshot pool can still exceed the
-          reserve by up to ``max_live_requests x _max_seq_len`` tokens' bytes. No
-          measured run reached it (saturated pool + 16 x 16k, 8 x 32k and one 128k
-          request peaked at 49.9 GB of a 55.6 GB working set). A higher
-          ``--mem-fraction-static`` shrinks the reserve, and with it
-          ``max_running_requests`` and ``max_total_num_tokens`` (0.95: about
-          6 requests / 46k tokens on a 64 GB host; 0.99: 1 request / 8k), a
-          startup warning says so;
-        * the committed budget is split between KV pool and snapshots with
-          ``mamba_full_memory_ratio`` (as CUDA does), or an explicit
-          ``--max-mamba-cache-size`` times the measured snapshot size; what the
-          token bound leaves of the KV share goes to snapshots.
+        * the snapshots get ``mamba_full_memory_ratio / (1 + ratio)`` of it (as on
+          CUDA), or an explicit ``--max-mamba-cache-size`` times the measured
+          snapshot size; the pool never holds more, so a snapshot-dense radix
+          tree cannot grow past it;
+        * the rest, ``free``, is for the KV pool and the running requests: a
+          quarter of it backs the per-request fixed footprint (snapshot-sized live
+          state + the first KV chunk, x ``_LIVE_REQUEST_SLACK``), which bounds
+          ``max_live_requests``; three quarters back the live tokens, each costing
+          the pool's bytes once (the pool) plus up to three times in the
+          request's contiguous cache (capacity below twice its tokens, and a cache
+          that is growing holds the old and the new buffer: 1.5 x capacity), so
+          ``max_total_num_tokens = 3/4 x free / (4 x bytes per token)``.
+          Every live token also occupies the shared token pool, so live tokens
+          evict radix tokens and the snapshots hanging off them;
+        * what ``mem_fraction_static`` does not commit stays free headroom for
+          activations and the allocator.
 
-        Without this the KV pool took the whole budget and the snapshots and the
-        live caches ran the device out of memory.
+        Worst case on Qwen3.5-4B (51.8 GiB working set, defaults): 402 snapshots
+        (20.7 GB) + one request of 131073 tokens (capacity 262144 = 8.6 GB, 12.9 GB
+        while growing) + the KV pool + 23 short requests with their live states +
+        weights is about 45 GB of 55.6 GB. A snapshot-dense saturation (756
+        single-chunk prompts) followed by a 133k-token prompt killed the previous
+        sizing at 54.6 GB, which gave the leftover of the token bound to the
+        snapshots.
         """
         self._aux_state_budget_bytes: int | None = None
         self._snapshot_bytes: int | None = None
@@ -768,11 +766,9 @@ class MlxModelRunner:
         )
         bytes_per_slot = 2 * num_layers * n_kv_heads * head_dim * dtype.size
         token_cap: int | None = None
-        leftover = 0
+        free = 0
         if hybrid_radix:
             snapshot_bytes, live_kv_bytes = self._measure_request_footprint()
-            reserve = max(mlx_limit - mlx_usable, 0)
-            reserve_fixed = reserve // 2
             per_request = int((snapshot_bytes + live_kv_bytes) * _LIVE_REQUEST_SLACK)
             explicit_slots = get_schedule().max_mamba_cache_size
             if explicit_slots is not None:
@@ -793,27 +789,28 @@ class MlxModelRunner:
             else:
                 ratio = get_schedule().mamba_full_memory_ratio
                 aux_budget = int(kv_budget * ratio / (1 + ratio))
+            free = max(kv_budget - aux_budget, 0)
             slots = aux_budget // max(snapshot_bytes, 1)
             # A running request holds a live and a tracked snapshot slot and its
-            # KV cache: bound the running requests by the reserve and by the slots.
+            # KV cache: bound the running requests by the budget and by the slots.
             self.max_live_requests = max(
                 1,
                 min(
-                    reserve_fixed // max(per_request, 1),
+                    (free // 4) // max(per_request, 1),
                     max(slots, MIN_AUX_STATE_SLOTS) // 2,
                 ),
             )
-            token_cap = reserve // (2 * bytes_per_slot)
+            token_cap = (free * 3 // 4) // (4 * bytes_per_slot)
             self._aux_state_budget_bytes = aux_budget
             self._snapshot_bytes = snapshot_bytes
-            kv_budget -= aux_budget
+            kv_budget = free
             logger.info(
                 "Per-request footprint: snapshot %.1f MB, live attention KV %.1f MB; "
-                "reserve %.2f GiB (1 - mem_fraction_static of the working set): "
+                "%.2f GiB beside the snapshots for the KV pool and running requests: "
                 "max_live_requests=%d, live-token bound %d",
                 snapshot_bytes / 1e6,
                 live_kv_bytes / 1e6,
-                reserve / 1024**3,
+                free / 1024**3,
                 self.max_live_requests,
                 token_cap,
             )
@@ -822,11 +819,13 @@ class MlxModelRunner:
             or self.max_live_requests < _MIN_COMFORTABLE_REQUESTS
         ):
             logger.warning(
-                "mem_fraction_static=%.3f leaves a %.2f GiB reserve for running "
-                "requests: at most %d running requests and %d live tokens. Lower "
-                "--mem-fraction-static to serve more or longer requests.",
+                "The device budget leaves %.2f GiB beside the snapshots for the KV "
+                "pool and the running requests (mem_fraction_static=%.3f): at most "
+                "%d running requests and %d live tokens. Raise --mem-fraction-static "
+                "or lower --max-mamba-cache-size / --mamba-full-memory-ratio to "
+                "serve more or longer requests.",
+                free / 1024**3,
                 self._mem_fraction_static,
-                reserve / 1024**3,
                 self.max_live_requests,
                 token_cap,
             )
@@ -834,18 +833,17 @@ class MlxModelRunner:
             if token_cap is not None and explicit_size > token_cap:
                 logger.warning(
                     "--max-total-tokens %d exceeds the %d live tokens the device "
-                    "reserve backs (each live token is also held in a request's "
+                    "budget backs (each live token is also held in a request's "
                     "contiguous cache); long-context concurrency is unbounded.",
                     explicit_size,
                     token_cap,
                 )
-            self._finish_aux_budget(0)
+            self._finish_aux_budget()
             return explicit_size
         pool_size = max(kv_budget // bytes_per_slot, 256)
         if token_cap is not None and pool_size > token_cap:
             pool_size = max(token_cap, 256)
-            leftover = kv_budget - pool_size * bytes_per_slot
-        self._finish_aux_budget(leftover)
+        self._finish_aux_budget()
         logger.info(
             f"Auto-sized attention KV pool: "
             f"aux_state_budget={(self._aux_state_budget_bytes or 0) / (1024**3):.2f} GiB, "
@@ -858,11 +856,11 @@ class MlxModelRunner:
         )
         return pool_size
 
-    def _finish_aux_budget(self, leftover_bytes: int) -> None:
-        """Hand what the live-token bound leaves of the KV share to the snapshots."""
+    def _finish_aux_budget(self) -> None:
+        """Turn the snapshot budget into slots (with the floor) and re-bound the
+        running requests by them."""
         if self._aux_state_budget_bytes is None:
             return
-        self._aux_state_budget_bytes += max(leftover_bytes, 0)
         backed = self._aux_state_budget_bytes // max(self._snapshot_bytes, 1)
         if backed < MIN_AUX_STATE_SLOTS:
             logger.warning(

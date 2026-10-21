@@ -39,6 +39,7 @@ if _HAS_MLX:
     from sglang.srt.runtime_context import get_context, reset_context
 
 MIB = 1024 * 1024
+GIB = 1024**3
 
 
 class _Cache:
@@ -128,8 +129,6 @@ class _Layout:
 
 @unittest.skipUnless(_HAS_MLX, "requires mlx")
 class TestRunnerBudget(unittest.TestCase):
-    GIB = 1024**3
-
     def setUp(self):
         reset_context()
         self.addCleanup(reset_context)
@@ -145,16 +144,16 @@ class TestRunnerBudget(unittest.TestCase):
         runner._measure_request_footprint = lambda: (snapshot, 128 * MIB)
         return runner
 
-    def _size(self, runner, explicit_size=None, **server_args):
+    def _size(self, runner, explicit_size=None, limit=50 * GIB, **server_args):
         server_args.setdefault("mamba_full_memory_ratio", 0.9)
         with (
             mock.patch(
                 "sglang.srt.hardware_backend.mlx.model_runner.psutil.virtual_memory",
-                return_value=SimpleNamespace(available=100 * self.GIB),
+                return_value=SimpleNamespace(available=100 * GIB),
             ),
             mock.patch(
                 "sglang.srt.hardware_backend.mlx.model_runner.mx.device_info",
-                return_value={"max_recommended_working_set_size": 50 * self.GIB},
+                return_value={"max_recommended_working_set_size": limit},
             ),
             mock.patch(
                 "sglang.srt.hardware_backend.mlx.model_runner.mx.get_active_memory",
@@ -164,66 +163,125 @@ class TestRunnerBudget(unittest.TestCase):
         ):
             return runner._compute_pool_size(explicit_size)
 
-    def test_the_reserve_is_what_mem_fraction_static_leaves_and_bounds_the_requests(
-        self,
-    ):
+    def _expected(self, runner, snapshot=50 * MIB, limit=50 * GIB, ratio=0.9):
+        """The sizing arithmetic, written out: (aux budget, free, requests, tokens)."""
+        budget = int(limit * runner._mem_fraction_static)
+        aux = int(budget * ratio / (1 + ratio))
+        free = budget - aux
+        per_request = int((snapshot + 128 * MIB) * 1.25)
+        requests = max(1, min((free // 4) // per_request, max(aux // snapshot, 8) // 2))
+        return aux, free, requests, (free * 3 // 4) // (4 * 32768)
+
+    def test_the_budget_beside_the_snapshots_bounds_requests_and_live_tokens(self):
         plain = self._runner(has_aux=False)
         hybrid = self._runner()
 
         plain_slots = self._size(plain)
         hybrid_slots = self._size(hybrid)
 
+        aux, free, requests, tokens = self._expected(hybrid)
         self.assertIsNone(plain._aux_state_budget_bytes)
         self.assertIsNone(plain.max_live_requests)
-        # working set 50 GiB, mem_fraction_static 0.8: 10 GiB reserve, half for the
-        # fixed per-request footprint: (50 + 128) MiB x 1.25 = 222.5 MiB -> 23
-        self.assertEqual(hybrid.max_live_requests, 23)
-        # the live tokens are bounded by the reserve over the doubling worst case:
-        # 10 GiB / (2 x 32768 B), and the KV pool is cut to it
-        self.assertEqual(hybrid_slots, 10 * self.GIB // (2 * 32768))
+        self.assertEqual(hybrid._aux_state_budget_bytes, aux)
+        # a quarter of what is beside the snapshots backs the per-request footprint
+        # ((50 + 128) MiB x 1.25 = 222.5 MiB), three quarters the live tokens, each
+        # counted once in the pool and up to three times in a growing cache
+        self.assertEqual(hybrid.max_live_requests, requests)
+        self.assertEqual(hybrid_slots, tokens)
         self.assertLess(hybrid_slots, plain_slots)
-        # the KV share the bound leaves goes to the snapshots (above the 0.9/1.9 split)
-        split = int(40 * self.GIB * 0.9 / 1.9)
-        self.assertGreater(hybrid._aux_state_budget_bytes, split)
-        self.assertEqual(
-            hybrid._aux_state_budget_bytes + hybrid_slots * 32768, 40 * self.GIB
-        )
-        self.assertEqual(
-            hybrid.aux_state_slots, hybrid._aux_state_budget_bytes // (50 * MIB)
-        )
+        # the snapshots keep their share: nothing the token bound leaves is given
+        # to them (a snapshot-dense tree filling a bigger pool killed the engine)
+        self.assertEqual(hybrid.aux_state_slots, aux // (50 * MIB))
 
-    def test_a_high_mem_fraction_static_warns_that_it_shrinks_the_engine(self):
-        runner = self._runner()
-        runner._mem_fraction_static = 0.95
-
-        with self.assertLogs(
-            "sglang.srt.hardware_backend.mlx.model_runner", level="WARNING"
-        ) as logs:
-            slots = self._size(runner)
-
-        # 2.5 GiB reserve: 5 requests, 20480 live tokens
-        self.assertEqual(runner.max_live_requests, 5)
-        self.assertEqual(slots, int(2.5 * self.GIB) // (2 * 32768))
-        self.assertIn("--mem-fraction-static", logs.output[0])
-
-    def test_the_default_fraction_does_not_warn(self):
-        runner = self._runner()
-        runner._mem_fraction_static = 0.6  # 20 GiB reserve
-
-        with self.assertNoLogs(
-            "sglang.srt.hardware_backend.mlx.model_runner", level="WARNING"
-        ):
-            self._size(runner)
-
-    def test_a_lower_mem_fraction_static_leaves_more_reserve_and_more_requests(self):
+    def test_a_lower_mem_fraction_static_means_fewer_requests_and_tokens(self):
         low = self._runner()
-        low._mem_fraction_static = 0.6
+        low._mem_fraction_static = 0.5
         default = self._runner()
 
-        self._size(low)
-        self._size(default)
+        low_tokens = self._size(low)
+        default_tokens = self._size(default)
 
-        self.assertGreater(low.max_live_requests, default.max_live_requests)
+        self.assertLess(low.max_live_requests, default.max_live_requests)
+        self.assertLess(low_tokens, default_tokens)
+
+    LOGGER = "sglang.srt.hardware_backend.mlx.model_runner"
+
+    def _warns(self, runner, **kwargs):
+        """The tokens the sizing returns and its 'budget is small' warning lines."""
+        with self.assertLogs(self.LOGGER, level="INFO") as logs:
+            tokens = self._size(runner, **kwargs)
+        warned = [
+            line
+            for line in logs.output
+            if "beside the snapshots" in line and "WARNING" in line
+        ]
+        return tokens, warned
+
+    def test_few_requests_and_few_tokens_warn(self):
+        runner = self._runner(snapshot=400 * MIB)
+        runner._mem_fraction_static = 0.3
+
+        tokens, warned = self._warns(runner)
+
+        self.assertLess(runner.max_live_requests, 8)
+        self.assertLess(tokens, 65536)
+        self.assertEqual(len(warned), 1)
+        self.assertIn("--mem-fraction-static", warned[0])
+
+    def test_few_running_requests_alone_warn(self):
+        # a big snapshot keeps the token bound high but allows 7 requests
+        runner = self._runner(snapshot=450 * MIB)
+
+        tokens, warned = self._warns(runner)
+
+        self.assertEqual(runner.max_live_requests, 7)
+        self.assertGreaterEqual(tokens, 65536)
+        self.assertEqual(len(warned), 1)
+
+    def test_the_request_threshold_is_eight(self):
+        runner = self._runner(snapshot=400 * MIB)
+
+        tokens, warned = self._warns(runner)
+
+        self.assertEqual(runner.max_live_requests, 8)
+        self.assertEqual(warned, [])
+
+    def test_few_live_tokens_alone_warn(self):
+        runner = self._runner(snapshot=1 * MIB)
+        runner._mem_fraction_static = 0.35
+
+        tokens, warned = self._warns(runner)
+
+        self.assertGreaterEqual(runner.max_live_requests, 8)
+        self.assertLess(tokens, 65536)
+        self.assertEqual(len(warned), 1)
+
+    def test_the_token_threshold_is_65536(self):
+        # a working set of 21761167632 B gives exactly 65536 tokens (65535 one byte less)
+        runner = self._runner(snapshot=1 * MIB)
+        runner._mem_fraction_static = 1.0
+
+        tokens, warned = self._warns(runner, limit=21761167632)
+
+        self.assertEqual(tokens, 65536)
+        self.assertEqual(warned, [])
+
+    def test_a_roomy_budget_does_not_warn(self):
+        runner = self._runner()
+
+        _, warned = self._warns(runner)
+
+        self.assertEqual(warned, [])
+
+    def test_the_log_line_reports_the_final_kv_pool(self):
+        runner = self._runner()
+
+        with self.assertLogs(self.LOGGER, level="INFO") as logs:
+            slots = self._size(runner)
+
+        line = next(line for line in logs.output if "Auto-sized" in line)
+        self.assertIn(f"pool_size={slots}", line)
+        self.assertIn(f"kv_pool={slots * 32768 / GIB:.2f} GiB", line)
 
     def test_running_requests_are_bounded_by_the_snapshot_slots_too(self):
         runner = self._runner()
@@ -232,21 +290,19 @@ class TestRunnerBudget(unittest.TestCase):
 
         # an explicit slot count replaces the ratio split: 16 slots, 2 per request
         self.assertEqual(runner._snapshot_bytes, 50 * MIB)
-        self.assertGreaterEqual(runner._aux_state_budget_bytes, 16 * 50 * MIB)
+        self.assertEqual(runner._aux_state_budget_bytes, 16 * 50 * MIB)
         self.assertEqual(runner.max_live_requests, 8)
 
     def test_an_explicit_kv_pool_size_still_budgets_the_snapshots(self):
         runner = self._runner()
 
-        with self.assertLogs(
-            "sglang.srt.hardware_backend.mlx.model_runner", level="WARNING"
-        ) as logs:
+        with self.assertLogs(self.LOGGER, level="WARNING") as logs:
             slots = self._size(runner, explicit_size=10_000_000)
 
         self.assertEqual(slots, 10_000_000)
-        self.assertIsNotNone(runner._aux_state_budget_bytes)
-        self.assertEqual(runner.max_live_requests, 23)
-        self.assertIn("live tokens the device reserve backs", logs.output[0])
+        self.assertEqual(runner._aux_state_budget_bytes, self._expected(runner)[0])
+        self.assertEqual(runner.max_live_requests, self._expected(runner)[2])
+        self.assertIn("live tokens the device budget backs", logs.output[0])
 
     def test_an_explicit_snapshot_count_the_device_cannot_hold_is_refused(self):
         runner = self._runner()
@@ -255,11 +311,9 @@ class TestRunnerBudget(unittest.TestCase):
             self._size(runner, max_mamba_cache_size=100_000)
 
     def test_the_slot_floor_is_kept_with_a_warning_when_the_budget_backs_fewer(self):
-        runner = self._runner(snapshot=12 * self.GIB)
+        runner = self._runner(snapshot=12 * GIB)
 
-        with self.assertLogs(
-            "sglang.srt.hardware_backend.mlx.model_runner", level="WARNING"
-        ) as logs:
+        with self.assertLogs(self.LOGGER, level="WARNING") as logs:
             self._size(runner)
 
         self.assertTrue(
