@@ -196,6 +196,9 @@ class _FakeBatch:
         # Arbitrary but correctly-sized token / slot arrays.
         self.input_ids = torch.arange(total, dtype=torch.long)
         self.out_cache_loc = torch.arange(total, dtype=torch.long)
+        # The deferred copy-on-write of the radix-matched auxiliary state.
+        self.mamba_cow_src_indices = None
+        self.mamba_cow_dst_indices = None
 
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
@@ -353,6 +356,37 @@ class TestMlxExtendRouting(CustomTestCase):
         batch = _FakeBatch(ForwardMode.EXTEND, [req], [2])
         worker._async_extend_batch(batch)
         self.assertEqual(worker._mlx_runner.prefix_slot_ids["r1"], [11, 12, 13])
+
+    def test_async_launch_copies_the_matched_auxiliary_state_before_any_prefill(self):
+        """The deferred copy-on-write of a prefix hit's snapshot runs before the
+        prefill that restores it (py-sglang#13)."""
+        calls = []
+        pool = SimpleNamespace(
+            req_to_token=torch.zeros(2, 8, dtype=torch.int32),
+            auxiliary_state_pool=SimpleNamespace(
+                copy_from=lambda src, dst: calls.append(
+                    ("copy_from", src.tolist(), dst.tolist())
+                )
+            ),
+        )
+        worker = self._worker(known_rids=set())
+        worker.req_to_token_pool = None
+        worker._model_runner = SimpleNamespace(req_to_token_pool=pool)
+        runner = worker._mlx_runner
+        original = runner.prefill_start
+
+        def prefill_start(**kwargs):
+            calls.append(("prefill_start",))
+            return original(**kwargs)
+
+        runner.prefill_start = prefill_start
+        batch = _FakeBatch(ForwardMode.EXTEND, [_FakeReq("r1", req_pool_idx=1)], [2])
+        batch.mamba_cow_src_indices = torch.tensor([5])
+        batch.mamba_cow_dst_indices = torch.tensor([7])
+
+        worker._async_extend_batch(batch)
+
+        self.assertEqual(calls, [("copy_from", [5], [7]), ("prefill_start",)])
 
     def test_async_genuine_mixed_decode_routes_to_decode(self):
         p, d = _FakeReq("p1"), _FakeReq("d1")

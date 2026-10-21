@@ -468,8 +468,28 @@ class MlxTpModelWorker(TpModelWorker):
             f"MLX async runner does not support forward mode: {forward_mode}"
         )
 
+    def _execute_deferred_auxiliary_state_cow(self, batch: ScheduleBatch) -> None:
+        """Copy the radix-matched auxiliary state into each request's own slot.
+
+        A prefix hit leaves the tree's snapshot to be copied (copy-on-write) into
+        the slot the request owns; ``ScheduleBatch`` defers that copy to the
+        forward (``mamba_cow_src_indices`` / ``mamba_cow_dst_indices``), where the
+        CUDA ``ModelRunner`` performs it. The MLX path never did, so every hit
+        found its own slot empty, could not restore the prefix state, and ran the
+        whole prompt again in one forward (py-sglang#13).
+        """
+        src = batch.mamba_cow_src_indices
+        dst = batch.mamba_cow_dst_indices
+        if src is None or dst is None or len(src) == 0:
+            return
+        pool = self._model_runner.req_to_token_pool
+        pool = getattr(pool, "auxiliary_state_pool", None)
+        if pool is not None:
+            pool.copy_from(src, dst)
+
     def _async_extend_batch(self, batch: ScheduleBatch) -> MlxLaunch:
         """Launch each request in an EXTEND batch lazily and kick GPU work."""
+        self._execute_deferred_auxiliary_state_cow(batch)
         reqs = batch.reqs
         input_ids_cpu = batch.input_ids.cpu().tolist()
         out_cache_loc_cpu = batch.out_cache_loc.cpu().tolist()

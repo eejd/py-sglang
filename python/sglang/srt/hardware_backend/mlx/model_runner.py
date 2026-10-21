@@ -94,6 +94,8 @@ logger = logging.getLogger(__name__)
 # running request against 185.7 MB measured (snapshot state + first KV chunk), x1.10;
 # 1.25 leaves margin over that.
 _LIVE_REQUEST_SLACK = 1.25
+# Pieces a prompt is run in when its cached prefix state cannot be restored.
+_PROMPT_CHUNK = 4096
 # Below these the budget beside the snapshots leaves the engine awkward to use.
 _MIN_COMFORTABLE_REQUESTS = 8
 _MIN_COMFORTABLE_TOKENS = 65536
@@ -722,16 +724,12 @@ class MlxModelRunner:
         133k-token prompt killed the previous sizing at 54.6 GB, which gave the
         leftover of the token bound to the snapshots.
 
-        NOT covered: requests that reuse a cached prefix. The token bound counts
-        the pool's unique tokens, but a request that hits the radix tree gathers
-        its prefix into a PRIVATE contiguous cache (``_materialize_pool_backed_
-        attention``), so N requests sharing a P-token prefix cost the pool P tokens
-        once and N x capacity(P) bytes in caches; and the prefix-hit prefill itself
-        peaks far above that: one request with a 28.7k-token cached prefix and a
-        3.4k-token suffix peaked 30 GB above an idle engine, which an engine
-        saturated with snapshots (28 GB) cannot take (py-sglang#13). Partial hits
-        on long prefixes are therefore unsafe with the radix cache on; whole-prompt
-        repeats and distinct prompts are measured safe.
+        NOT covered here: many concurrent requests that reuse a cached prefix
+        (py-sglang#15). The token bound counts the pool's unique tokens, but a
+        request that hits the radix tree gathers its prefix into a PRIVATE
+        contiguous cache (``_materialize_pool_backed_attention``), so N requests
+        sharing a P-token prefix cost the pool P tokens once and N x capacity(P)
+        bytes in caches; this sizing does not bound that.
         """
         self._aux_state_budget_bytes: int | None = None
         self._snapshot_bytes: int | None = None
@@ -1168,9 +1166,13 @@ class MlxModelRunner:
                 # full-prompt fallback for that edge while still syncing newly
                 # allocated attention KV below.
                 cache = self._acquire_cache()
-                input_ids = mx.array([full_token_ids or new_token_ids], dtype=mx.int32)
-                lazy_token, lazy_logprobs = self._forward_lazy_token(
-                    input_ids, cache, needs_logits, req_id, logit_edit_row, logprob_spec
+                lazy_token, lazy_logprobs = self._forward_prompt_lazy_token(
+                    full_token_ids or new_token_ids,
+                    cache,
+                    needs_logits,
+                    req_id,
+                    logit_edit_row,
+                    logprob_spec,
                 )
                 if new_slot_ids:
                     self._sync_new_kv_to_pool(cache, prefix_len, new_slot_ids)
@@ -1356,6 +1358,34 @@ class MlxModelRunner:
         edits = logit_edit_row[None, :] if logit_edit_row is not None else None
         return self._select_tokens_with_logprobs(
             logits[:, -1, :], [req_id], [cache], edits, logprob_spec
+        )
+
+    def _forward_prompt_lazy_token(
+        self,
+        token_ids: list[int],
+        cache: list[Any],
+        needs_logits: bool,
+        req_id: str,
+        logit_edit_row: mx.array | None = None,
+        logprob_spec: MlxLogprobSpec | None = None,
+    ) -> tuple[mx.array, MlxLazyLogprobs | None]:
+        """Run a whole prompt through a fresh *cache* in ``_PROMPT_CHUNK`` pieces.
+
+        The leading pieces are evaluated (their output is discarded; evaluating
+        keeps the attention and scan intermediates of one piece alive at a time),
+        the last one stays lazy for the caller. A single forward over a long
+        prompt materialises scores of the order ``len^2``: 32k tokens took 25 GB,
+        130k does not fit (py-sglang#13).
+        """
+        last_start = ((len(token_ids) - 1) // _PROMPT_CHUNK) * _PROMPT_CHUNK
+        for start in range(0, last_start, _PROMPT_CHUNK):
+            piece = mx.array([token_ids[start : start + _PROMPT_CHUNK]], dtype=mx.int32)
+            if self._trunk_forward(piece, cache) is None:
+                self.model(piece, cache=cache)
+            mx.eval(*self.cache_state_arrays([cache]))
+        input_ids = mx.array([token_ids[last_start:]], dtype=mx.int32)
+        return self._forward_lazy_token(
+            input_ids, cache, needs_logits, req_id, logit_edit_row, logprob_spec
         )
 
     def _select_tokens_with_logprobs(
