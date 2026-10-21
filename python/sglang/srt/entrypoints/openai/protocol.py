@@ -814,6 +814,28 @@ class Tool(BaseModel):
             self.function.defer_loading = self.defer_loading
         return self
 
+    def to_template_dict(self) -> dict:
+        """The tool for the chat template, in the OpenAI schema's key order.
+
+        Templates render ``tools`` verbatim (``{{ tool | tojson }}``), so a field
+        the client never set (``strict: false``, ``defer_loading: null``) adds
+        tokens that no other engine shows the model and shifts greedy decoding.
+        Only fields that were set and are not null are rendered, ``name`` before
+        ``description`` as in the OpenAI schema. ``Function``'s own field order
+        (and so ``model_dump()``, which other consumers read) is unchanged."""
+        data = self.model_dump(exclude_unset=True)
+        function = data.get("function", {})
+        ordered = {
+            key: function[key]
+            for key in ("name", "description", "parameters", "strict", "defer_loading")
+            if function.get(key) is not None
+        }
+        ordered.update(
+            {k: v for k, v in function.items() if k not in ordered and v is not None}
+        )
+        data["function"] = ordered
+        return {k: v for k, v in data.items() if v is not None}
+
 
 # Tool is defined after the message params that reference it, so the forward
 # reference has to be resolved explicitly.

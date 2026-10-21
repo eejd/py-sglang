@@ -1425,12 +1425,12 @@ class OpenAIServingChat(OpenAIServingBase):
             request.skip_special_tokens = False
             if not isinstance(request.tool_choice, str):
                 tools = [
-                    item.model_dump()
+                    item.to_template_dict()
                     for item in request.tools or []
                     if item.function.name == request.tool_choice.function.name
                 ] or None
             elif request.tools:
-                tools = [item.model_dump() for item in request.tools]
+                tools = [item.to_template_dict() for item in request.tools]
             if self.tool_call_parser and not glm_constraint:
                 parser = FunctionCallParser(
                     effective_tools,

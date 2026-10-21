@@ -1282,9 +1282,28 @@ class ServingChatTestCase(CustomTestCase):
 
         self.chat._process_messages(req, is_multimodal=False)
 
-        expected_tools = [tool.model_dump() for tool in req.tools]
+        # The tool as the client sent it: no `strict: false` / `defer_loading: null`.
+        expected_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "add",
+                    "description": "Add two numbers.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "a": {"type": "integer"},
+                            "b": {"type": "integer"},
+                        },
+                        "required": ["a", "b"],
+                    },
+                },
+            }
+        ]
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertEqual(kwargs["tools"], expected_tools)
+        # key order too: the template renders `tool | tojson`
+        self.assertEqual(json.dumps(kwargs["tools"]), json.dumps(expected_tools))
 
     def test_glm47_without_tools_has_no_tool_call_constraint(self):
         """A plain GLM47 chat must not get the full-assistant EBNF: its
@@ -1343,10 +1362,9 @@ class ServingChatTestCase(CustomTestCase):
         second_tools = self.tm.tokenizer.apply_chat_template.call_args_list[1].kwargs[
             "tools"
         ]
-        self.assertEqual(first_tools, [tool.model_dump() for tool in req.tools])
-        self.assertEqual(
-            second_tools, [tool.function.model_dump() for tool in req.tools]
-        )
+        self.assertNotIn("strict", first_tools[0]["function"])
+        self.assertNotIn("defer_loading", first_tools[0])
+        self.assertEqual(second_tools, [first_tools[0]["function"]])
 
     def test_glm47_constraint_includes_message_tools(self):
         """Constrain every active message tool, but none when tool use is disabled.
