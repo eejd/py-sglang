@@ -317,6 +317,7 @@ class MlxAuxiliaryStateComponent(MambaComponent):
                 f"got {type(pool)}"
             )
         TreeComponent.__init__(self, cache, params)
+        self._init_mamba_settings(params)
         self.enable_mamba_extra_buffer = False
         self._mamba_pool_host = None
 
