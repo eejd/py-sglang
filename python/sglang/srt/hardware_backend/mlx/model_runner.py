@@ -766,16 +766,15 @@ class MlxModelRunner:
         133k-token prompt killed the previous sizing at 54.6 GB, which gave the
         leftover of the token bound to the snapshots.
 
-        NOT covered: requests that reuse a cached prefix. The token bound counts
-        the pool's unique tokens, but a request that hits the radix tree gathers
-        its prefix into a PRIVATE contiguous cache (``_materialize_pool_backed_
-        attention``), so N requests sharing a P-token prefix cost the pool P tokens
-        once and N x capacity(P) bytes in caches; and the prefix-hit prefill itself
-        peaks far above that: one request with a 28.7k-token cached prefix and a
-        3.4k-token suffix peaked 30 GB above an idle engine, which an engine
-        saturated with snapshots (28 GB) cannot take (py-sglang#13). Partial hits
-        on long prefixes are therefore unsafe with the radix cache on; whole-prompt
-        repeats and distinct prompts are measured safe.
+        NOT covered: many concurrent requests that reuse a cached prefix
+        (py-sglang#15). The token bound counts the pool's unique tokens, but a
+        request that hits the radix tree gathers its prefix into a PRIVATE
+        contiguous cache (``_materialize_pool_backed_attention``), so N requests
+        sharing a P-token prefix cost the pool P tokens once and N x capacity(P)
+        bytes in caches. On a snapshot-saturated Qwen3.5-4B engine 24 concurrent
+        32k-token hits and 8 concurrent 131k-token hits exhausted the working set;
+        1 to 16 concurrent 32k hits, 4 x 60k, 16 x 16k, 16 x 8k and repeated
+        prompts completed (see the PR for the measured peaks).
         """
         self._aux_state_budget_bytes: int | None = None
         self._snapshot_bytes: int | None = None
@@ -884,12 +883,12 @@ class MlxModelRunner:
                 )
             self._finish_aux_budget()
             return explicit_size
-        # What the KV pool may take: with snapshots reserved it is the rest of the
-        # budget (then cut to the live-token bound below), else the whole budget.
-        pool_budget = free if hybrid_radix else kv_budget
-        pool_size = max(pool_budget // bytes_per_slot, 256)
-        if token_cap is not None and pool_size > token_cap:
+        # With snapshots reserved the pool is the live-token bound, which is a share
+        # of what the snapshots leave (``free``); else it is the whole budget.
+        if token_cap is not None:
             pool_size = max(token_cap, 256)
+        else:
+            pool_size = max(kv_budget // bytes_per_slot, 256)
         self._finish_aux_budget()
         logger.info(
             f"Auto-sized attention KV pool: "

@@ -114,6 +114,67 @@ class TestAuxiliaryStatePoolBudget(unittest.TestCase):
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 2)
 
 
+@unittest.skipUnless(_HAS_MLX, "requires mlx")
+class TestSnapshotsFreeTheirMemoryWithoutTheCollector(unittest.TestCase):
+    """Evicting a snapshot has to free its device memory at once. The cyclic
+    garbage collector does not see device memory, so state kept alive by a Python
+    reference cycle piled up between its runs: a burst of long requests ran the
+    device out of memory with nearly all of the snapshots evicted
+    (eejd/py-sglang#15)."""
+
+    def setUp(self):
+        import gc
+
+        self._gc = gc
+        gc.collect()
+        gc.disable()
+        self.addCleanup(gc.enable)
+
+    def test_taking_a_snapshot_leaves_no_cyclic_garbage(self):
+        pool = MlxAuxiliaryStatePool(size=4, device="cpu")
+        slot = pool.alloc(1)
+        self._gc.collect()
+
+        for _ in range(20):
+            pool.store_cache(slot[0], [_Cache()], [0])
+
+        self.assertEqual(self._gc.collect(), 0)
+
+    def test_an_evicted_snapshot_gives_its_device_memory_back_at_once(self):
+        pool = MlxAuxiliaryStatePool(size=4, device="cpu")
+        slot = pool.alloc(1)
+        cache = [_Cache()]
+        mx.eval(cache[0].state)
+        before = mx.get_active_memory()
+
+        pool.store_cache(slot[0], cache, [0])
+        held = mx.get_active_memory()
+        pool.free(slot)
+
+        self.assertGreater(held - before, MIB // 2)
+        self.assertLess(mx.get_active_memory() - before, MIB // 2)
+
+    def test_cache_state_nbytes_leaves_no_cyclic_garbage(self):
+        cache = [_Cache(), _Cache()]
+        self._gc.collect()
+
+        for _ in range(20):
+            cache_state_nbytes(cache, [0, 1])
+
+        self.assertEqual(self._gc.collect(), 0)
+
+    def test_arrays_in_tree_finds_every_array_of_a_nested_state_in_order(self):
+        from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
+            _arrays_in_tree,
+        )
+
+        a, b, c, d = (mx.array([i]) for i in range(4))
+
+        found = _arrays_in_tree(([a, (b, 3)], {"k": c, "j": [d]}, "text", None))
+
+        self.assertEqual([x.item() for x in found], [0, 1, 2, 3])
+
+
 class _Layout:
     """The layout fields the sizing and the init wiring read."""
 
