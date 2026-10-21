@@ -298,6 +298,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         runner._req_to_token_pool = None
         runner._req_caches = {}
+        runner._prefill_caches = {}
         runner._req_token_ids = {}
         runner._req_pool_idx = {}
         runner._req_synced_offset = {}
@@ -713,6 +714,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             auxiliary_state_size=4,
         )
         runner._req_caches = {}
+        runner._prefill_caches = {}
         runner._req_token_ids = {}
         runner._req_pool_idx = {}
         runner._req_synced_offset = {}
@@ -767,6 +769,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             auxiliary_state_size=4,
         )
         runner._req_caches = {}
+        runner._prefill_caches = {}
         runner._req_token_ids = {}
         runner._req_pool_idx = {}
         runner._req_synced_offset = {}
@@ -913,6 +916,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             auxiliary_state_size=4,
         )
         runner._req_caches = {}
+        runner._prefill_caches = {}
         runner._req_token_ids = {}
         runner._req_pool_idx = {}
         runner._req_synced_offset = {}
@@ -970,6 +974,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
             auxiliary_state_size=4,
         )
         runner._req_caches = {}
+        runner._prefill_caches = {}
         runner._req_token_ids = {}
         runner._req_pool_idx = {}
         runner._req_synced_offset = {}

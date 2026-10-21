@@ -188,6 +188,10 @@ class TestRunnerBudget(unittest.TestCase):
         # counted once in the pool and up to three times in a growing cache
         self.assertEqual(hybrid.max_live_requests, requests)
         self.assertEqual(hybrid_slots, tokens)
+        # the running requests' private caches may add up to twice the live tokens
+        # (a cache's capacity is below twice its tokens); dense models have no bound
+        self.assertEqual(hybrid.private_cache_budget_tokens, 2 * tokens)
+        self.assertIsNone(plain.private_cache_budget_tokens)
         self.assertLess(hybrid_slots, plain_slots)
         # the snapshots keep their share: nothing the token bound leaves is given
         # to them (a snapshot-dense tree filling a bigger pool killed the engine)
@@ -395,8 +399,14 @@ class TestWorkerHandsTheBudgetToTheStub(unittest.TestCase):
     def test_the_stub_gets_the_runner_budget(self):
         from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
 
+        in_use = lambda: 0  # noqa: E731
         runner = SimpleNamespace(
-            pool_size=1234, max_live_requests=7, aux_state_slots=99
+            pool_size=1234,
+            max_live_requests=7,
+            aux_state_slots=99,
+            private_cache_budget_tokens=2468,
+            private_cache_tokens_in_use=in_use,
+            _max_seq_len=4096,
         )
         stub_class = mock.Mock()
         stub_class.validate_startup_weight_load_mode = mock.Mock()
@@ -437,6 +447,9 @@ class TestWorkerHandsTheBudgetToTheStub(unittest.TestCase):
         self.assertEqual(kwargs["mlx_pool_size"], 1234)
         self.assertEqual(kwargs["mlx_max_live_requests"], 7)
         self.assertEqual(kwargs["mlx_aux_state_slots"], 99)
+        self.assertEqual(kwargs["mlx_private_cache_budget_tokens"], 2468)
+        self.assertIs(kwargs["mlx_private_cache_tokens_in_use"], in_use)
+        self.assertEqual(kwargs["mlx_private_cache_base"], 4096)
 
 
 @unittest.skipUnless(_HAS_MLX, "requires mlx")

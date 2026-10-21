@@ -117,6 +117,9 @@ class MlxTpModelWorker(TpModelWorker):
             mlx_pool_size=self._mlx_runner.pool_size,
             mlx_max_live_requests=self._mlx_runner.max_live_requests,
             mlx_aux_state_slots=self._mlx_runner.aux_state_slots,
+            mlx_private_cache_budget_tokens=self._mlx_runner.private_cache_budget_tokens,
+            mlx_private_cache_tokens_in_use=self._mlx_runner.private_cache_tokens_in_use,
+            mlx_private_cache_base=self._mlx_runner._max_seq_len,
         )
 
         self._mlx_active_rids: set[str] = set()

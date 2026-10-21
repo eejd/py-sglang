@@ -275,6 +275,12 @@ class MlxModelRunner:
         self._max_seq_len = 4096  # doubles on overflow
 
         self._req_caches: dict[str, list[Any]] = {}
+        # Caches of prefills launched but not finalised: live device memory the
+        # admission bound has to see before ``_req_caches`` does.
+        self._prefill_caches: dict[str, list[Any]] = {}
+        # Capacity tokens the running requests' private caches may add up to
+        # (hybrid model with the radix cache; set by ``_compute_pool_size``).
+        self.private_cache_budget_tokens: int | None = None
         self._req_token_ids: dict[str, list[int]] = {}
         self._req_sampling: dict[str, MlxSamplingParams] = {}
         # Reusable cache lists, for models without auxiliary layer state.
@@ -333,6 +339,15 @@ class MlxModelRunner:
         """Return a cache list to the pool for reuse."""
         if not self._cache_layout.has_auxiliary_state:
             self._cache_pool.append(cache)
+
+    def private_cache_tokens_in_use(self) -> int:
+        """Capacity tokens of the private attention caches of every request that
+        holds one (running, and prefills launched but not finalised)."""
+        total = 0
+        for cache in (*self._req_caches.values(), *self._prefill_caches.values()):
+            attention = self._first_attention_cache(cache)
+            total += getattr(attention, "max_seq_len", 0)
+        return total
 
     def _first_attention_cache(self, cache: list[Any]) -> Any:
         return cache[self._cache_layout.first_attention_layer_index]
@@ -753,6 +768,7 @@ class MlxModelRunner:
         self._snapshot_bytes: int | None = None
         self.max_live_requests: int | None = None
         self.aux_state_slots: int | None = None
+        self.private_cache_budget_tokens = None
         hybrid_radix = (
             self._cache_layout.has_auxiliary_state and not self.disable_radix_cache
         )
@@ -814,6 +830,9 @@ class MlxModelRunner:
                 ),
             )
             token_cap = (free * 3 // 4) // (4 * bytes_per_slot)
+            # Each live token also sits in a request's private cache of capacity
+            # below twice its tokens: the caches may add up to twice the token bound.
+            self.private_cache_budget_tokens = 2 * token_cap
             self._aux_state_budget_bytes = aux_budget
             self._snapshot_bytes = snapshot_bytes
             logger.info(
@@ -1086,7 +1105,13 @@ class MlxModelRunner:
         self.eval_pending(pending)
         return self.decode_batch_finalize(pending)
 
-    def prefill_start(
+    def prefill_start(self, *args, **kwargs) -> MlxPendingPrefill:
+        """Queue a prefill (see ``_prefill_start``) and register its cache as live."""
+        pending = self._prefill_start(*args, **kwargs)
+        self._prefill_caches[pending.req_id] = pending.cache
+        return pending
+
+    def _prefill_start(
         self,
         req_id: str,
         new_token_ids: list[int],
@@ -1271,6 +1296,7 @@ class MlxModelRunner:
             next_token
         ]
         self._req_caches[pending.req_id] = pending.cache
+        self._prefill_caches.pop(pending.req_id, None)
         self._req_pool_idx[pending.req_id] = pending.req_pool_idx
         self._req_synced_offset[pending.req_id] = pending.synced_offset
         self._store_auxiliary_state(pending.req_pool_idx, pending.cache)
@@ -1922,6 +1948,7 @@ class MlxModelRunner:
         self._req_token_ids.pop(req_id, None)
         self._req_sampling.pop(req_id, None)
         cache = self._req_caches.pop(req_id, None)
+        self._prefill_caches.pop(req_id, None)
         if cache is not None:
             self._release_cache(cache)
         self._req_pool_idx.pop(req_id, None)
@@ -1934,6 +1961,7 @@ class MlxModelRunner:
         for cache in self._req_caches.values():
             self._release_cache(cache)
         self._req_caches.clear()
+        self._prefill_caches.clear()
         self._req_pool_idx.clear()
         self._req_synced_offset.clear()
         if self._attention_kv_pool is not None:
