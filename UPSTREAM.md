@@ -23,4 +23,4 @@ posted to `sgl-project/sglang` before the quantbench + agentbench soak (ADR-0008
 | `topic/mlx-non-overlap-relay-device` | none yet | draft PR eejd/py-sglang#8 (eejd/py-sglang#5) |
 | `topic/tools-block-as-sent` | none yet | draft PR eejd/py-sglang#9 (eejd/py-sglang#4) |
 | `topic/mlx-grammar-requires-sampling` | none yet | draft PR eejd/py-sglang#10 (eejd/py-sglang#6) |
-| `topic/mlx-hybrid-aux-state-budget` | none yet | draft PR eejd/py-sglang#12 (eejd/py-sglang#11): live-request reserve and bound, 41 running requests on a 64 GB M5 Pro; stacked on `topic/mlx-hybrid-radix-auto-no-buffer` (#7) |
+| `topic/mlx-hybrid-aux-state-budget` | none yet | draft PR eejd/py-sglang#12 (eejd/py-sglang#11): live-request reserve derived from mem_fraction_static: 20 running requests and a 154793-token pool for Qwen3.5-4B on a 64 GB M5 Pro; stacked on `topic/mlx-hybrid-radix-auto-no-buffer` (#7) |
