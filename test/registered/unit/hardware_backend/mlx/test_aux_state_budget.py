@@ -138,9 +138,10 @@ class TestRunnerBudget(unittest.TestCase):
         runner = MlxModelRunner.__new__(MlxModelRunner)
         runner._cache_layout = _Layout(has_aux)
         runner.disable_radix_cache = disable_radix_cache
-        runner._mem_fraction_static = 1.0
+        runner._mem_fraction_static = 0.8
+        runner._max_seq_len = 4096
         runner._get_attn_config = lambda: (4, 256, mx.bfloat16)
-        # 50 MiB snapshot, 134 MiB of live attention KV: Qwen3.5-4B's measured shape
+        # 50 MiB snapshot, 128 MiB of live attention KV per request
         runner._measure_request_footprint = lambda: (snapshot, 128 * MIB)
         return runner
 
@@ -163,7 +164,9 @@ class TestRunnerBudget(unittest.TestCase):
         ):
             return runner._compute_pool_size(explicit_size)
 
-    def test_a_hybrid_model_with_the_radix_cache_reserves_live_kv_then_splits(self):
+    def test_the_reserve_is_what_mem_fraction_static_leaves_and_bounds_the_requests(
+        self,
+    ):
         plain = self._runner(has_aux=False)
         hybrid = self._runner()
 
@@ -172,12 +175,32 @@ class TestRunnerBudget(unittest.TestCase):
 
         self.assertIsNone(plain._aux_state_budget_bytes)
         self.assertIsNone(plain.max_live_requests)
-        # 10% of the 50 GiB working set is kept for the running requests' KV
-        budget = 45 * self.GIB
-        self.assertEqual(hybrid._aux_state_budget_bytes, int(budget * 0.9 / 1.9))
-        self.assertAlmostEqual(hybrid_slots / plain_slots, 1 / 1.9 * 0.9, 2)
-        # 5 GiB / 128 MiB = 40 running requests, 2 snapshot slots each
-        self.assertEqual(hybrid.max_live_requests, 40)
+        # working set 50 GiB, mem_fraction_static 0.8: 10 GiB reserve, half for the
+        # fixed per-request footprint: (50 + 128) MiB x 1.25 = 222.5 MiB -> 23
+        self.assertEqual(hybrid.max_live_requests, 23)
+        # the other half bounds the live tokens: 23 x 4096 first chunks plus
+        # 5 GiB / (2 x 32768 B), and the KV pool is cut to it
+        self.assertEqual(hybrid_slots, 23 * 4096 + 5 * self.GIB // (2 * 32768))
+        self.assertLess(hybrid_slots, plain_slots)
+        # the KV share the bound leaves goes to the snapshots (above the 0.9/1.9 split)
+        split = int(40 * self.GIB * 0.9 / 1.9)
+        self.assertGreater(hybrid._aux_state_budget_bytes, split)
+        self.assertEqual(
+            hybrid._aux_state_budget_bytes + hybrid_slots * 32768, 40 * self.GIB
+        )
+        self.assertEqual(
+            hybrid.aux_state_slots, hybrid._aux_state_budget_bytes // (50 * MIB)
+        )
+
+    def test_a_lower_mem_fraction_static_leaves_more_reserve_and_more_requests(self):
+        low = self._runner()
+        low._mem_fraction_static = 0.6
+        default = self._runner()
+
+        self._size(low)
+        self._size(default)
+
+        self.assertGreater(low.max_live_requests, default.max_live_requests)
 
     def test_running_requests_are_bounded_by_the_snapshot_slots_too(self):
         runner = self._runner()
@@ -185,17 +208,40 @@ class TestRunnerBudget(unittest.TestCase):
         self._size(runner, max_mamba_cache_size=16)
 
         # an explicit slot count replaces the ratio split: 16 slots, 2 per request
-        self.assertEqual(runner._aux_state_budget_bytes, 16 * 50 * MIB)
+        self.assertEqual(runner._snapshot_bytes, 50 * MIB)
+        self.assertGreaterEqual(runner._aux_state_budget_bytes, 16 * 50 * MIB)
         self.assertEqual(runner.max_live_requests, 8)
 
     def test_an_explicit_kv_pool_size_still_budgets_the_snapshots(self):
         runner = self._runner()
 
-        slots = self._size(runner, explicit_size=1234)
+        with self.assertLogs(
+            "sglang.srt.hardware_backend.mlx.model_runner", level="WARNING"
+        ) as logs:
+            slots = self._size(runner, explicit_size=10_000_000)
 
-        self.assertEqual(slots, 1234)
+        self.assertEqual(slots, 10_000_000)
         self.assertIsNotNone(runner._aux_state_budget_bytes)
-        self.assertEqual(runner.max_live_requests, 40)
+        self.assertEqual(runner.max_live_requests, 23)
+        self.assertIn("live tokens the device reserve backs", logs.output[0])
+
+    def test_an_explicit_snapshot_count_the_device_cannot_hold_is_refused(self):
+        runner = self._runner()
+
+        with self.assertRaisesRegex(ValueError, "--max-mamba-cache-size"):
+            self._size(runner, max_mamba_cache_size=100_000)
+
+    def test_the_slot_floor_is_kept_with_a_warning_when_the_budget_backs_fewer(self):
+        runner = self._runner(snapshot=12 * self.GIB)
+
+        with self.assertLogs(
+            "sglang.srt.hardware_backend.mlx.model_runner", level="WARNING"
+        ) as logs:
+            self._size(runner)
+
+        self.assertIn(f"keeps {MIN_AUX_STATE_SLOTS} slots", logs.output[0])
+        self.assertEqual(runner.aux_state_slots, MIN_AUX_STATE_SLOTS)
+        self.assertEqual(runner.max_live_requests, 1)
 
     def test_without_the_radix_cache_the_kv_pool_keeps_the_whole_budget(self):
         runner = self._runner(disable_radix_cache=True)
@@ -254,6 +300,55 @@ class TestRunnerBudget(unittest.TestCase):
         _, evaluated = self._sync(has_aux=False)
 
         self.assertEqual(evaluated, [])
+
+
+@unittest.skipUnless(_HAS_MLX, "requires mlx")
+class TestWorkerHandsTheBudgetToTheStub(unittest.TestCase):
+    def test_the_stub_gets_the_runner_budget(self):
+        from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
+
+        runner = SimpleNamespace(
+            pool_size=1234, max_live_requests=7, aux_state_slots=99
+        )
+        stub_class = mock.Mock()
+        stub_class.validate_startup_weight_load_mode = mock.Mock()
+        worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
+        worker.model_config = SimpleNamespace()
+        worker.gpu_id = 0
+        worker.nccl_port = 0
+        worker.server_args = SimpleNamespace()
+        worker.is_draft_worker = False
+        worker.req_to_token_pool = None
+        worker.token_to_kv_pool_allocator = None
+        worker.memory_pool_config = None
+        with (
+            mock.patch(
+                "sglang.srt.hardware_backend.mlx.model_runner_stub.MlxModelRunnerStub",
+                stub_class,
+            ),
+            mock.patch(
+                "sglang.srt.hardware_backend.mlx.model_runner.MlxModelRunner",
+                return_value=runner,
+            ),
+            get_context().override_server_args(
+                model_path="dummy",
+                trust_remote_code=False,
+                disable_radix_cache=False,
+                mem_fraction_static=0.8,
+                quantization=None,
+                revision=None,
+                mlx_enable_sampling=False,
+                random_seed=0,
+                enable_deterministic_inference=False,
+                max_total_tokens=None,
+            ),
+        ):
+            worker._init_model_runner()
+
+        kwargs = stub_class.call_args.kwargs
+        self.assertEqual(kwargs["mlx_pool_size"], 1234)
+        self.assertEqual(kwargs["mlx_max_live_requests"], 7)
+        self.assertEqual(kwargs["mlx_aux_state_slots"], 99)
 
 
 @unittest.skipUnless(_HAS_MLX, "requires mlx")

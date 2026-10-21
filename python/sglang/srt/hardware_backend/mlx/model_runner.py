@@ -88,9 +88,11 @@ from sglang.srt.runtime_context import (
 
 logger = logging.getLogger(__name__)
 
-# Share of the device working set kept free for the running requests' own
-# attention KV (preallocated per request, outside the pool) and activations.
-_LIVE_REQUEST_RESERVE_FRACTION = 0.10
+# Slack on a running request's measured device footprint (activations, allocator
+# rounding): the 256-request burst of Qwen3.5-4B (py-sglang#11) peaked 205 MB per
+# running request against 185.7 MB measured (snapshot state + first KV chunk), x1.10;
+# 1.25 leaves margin over that.
+_LIVE_REQUEST_SLACK = 1.25
 
 
 @dataclass
@@ -701,14 +703,25 @@ class MlxModelRunner:
 
         A model with auxiliary (GDN/mamba) state and the radix cache on also
         keeps one state snapshot per cached prefix, and every running request
-        holds its own preallocated attention KV. All of it is real device memory,
-        so the budget is split: a reserve for the running requests' KV (which also
-        bounds ``max_live_requests``), then the server's ``mamba_full_memory_ratio``
-        between the KV pool and the snapshots (as CUDA does), or an explicit
-        ``--max-mamba-cache-size`` times the measured snapshot size. The share left
-        for snapshots goes to the auxiliary-state pool in ``init_cache_pools``;
-        otherwise the KV pool takes the whole budget and the snapshots and the
-        live caches run the device out of memory.
+        holds its own live state and preallocated attention KV (a contiguous cache
+        that starts at ``_max_seq_len`` tokens and doubles, 2x the pool's per-token
+        bytes at worst). All of it is device memory, so:
+
+        * the pools may commit ``mem_fraction_static`` of the working set (as the
+          KV pool always could); the headroom ``(1 - mem_fraction_static)`` of the
+          working set is the reserve for the running requests;
+        * half of the reserve backs the per-request fixed footprint (snapshot-sized
+          live state + first KV chunk, x ``_LIVE_REQUEST_SLACK``), which bounds
+          ``max_live_requests``; the other half backs KV growth beyond the first
+          chunk, which bounds the token pool (``max_total_num_tokens``) because every
+          live token also sits in a request's contiguous cache;
+        * the committed budget is split between KV pool and snapshots with
+          ``mamba_full_memory_ratio`` (as CUDA does), or an explicit
+          ``--max-mamba-cache-size`` times the measured snapshot size; what the
+          token bound leaves of the KV share goes to snapshots.
+
+        Without this the KV pool took the whole budget and the snapshots and the
+        live caches ran the device out of memory.
         """
         self._aux_state_budget_bytes: int | None = None
         self._snapshot_bytes: int | None = None
@@ -739,47 +752,75 @@ class MlxModelRunner:
             int(sys_available * self._mem_fraction_static),
         )
         bytes_per_slot = 2 * num_layers * n_kv_heads * head_dim * dtype.size
+        token_cap: int | None = None
+        leftover = 0
         if hybrid_radix:
             snapshot_bytes, live_kv_bytes = self._measure_request_footprint()
-            live_reserve = int(mlx_limit * _LIVE_REQUEST_RESERVE_FRACTION)
-            kv_budget = max(kv_budget - live_reserve, 0)
+            reserve = max(mlx_limit - mlx_usable, 0)
+            reserve_fixed = reserve // 2
+            reserve_growth = reserve - reserve_fixed
+            per_request = int((snapshot_bytes + live_kv_bytes) * _LIVE_REQUEST_SLACK)
             explicit_slots = get_schedule().max_mamba_cache_size
             if explicit_slots is not None:
                 aux_budget = (
                     explicit_slots // get_parallel().attn_dp_size
                 ) * snapshot_bytes
+                if (
+                    explicit_size is None
+                    and aux_budget > kv_budget - 256 * bytes_per_slot
+                ):
+                    raise ValueError(
+                        f"--max-mamba-cache-size {explicit_slots} needs "
+                        f"{aux_budget / 1024**3:.2f} GiB of snapshots "
+                        f"({snapshot_bytes / 1e6:.1f} MB each) but the device budget "
+                        f"is {kv_budget / 1024**3:.2f} GiB, which leaves no KV pool. "
+                        "Lower it or raise --mem-fraction-static."
+                    )
             else:
                 ratio = get_schedule().mamba_full_memory_ratio
                 aux_budget = int(kv_budget * ratio / (1 + ratio))
-            slots = max(aux_budget // max(snapshot_bytes, 1), MIN_AUX_STATE_SLOTS)
-            if aux_budget // max(snapshot_bytes, 1) < MIN_AUX_STATE_SLOTS:
-                logger.warning(
-                    "The auxiliary-state budget (%.2f GiB) backs fewer than %d "
-                    "snapshots of %.1f MB; the pool keeps %d slots.",
-                    aux_budget / 1024**3,
-                    MIN_AUX_STATE_SLOTS,
-                    snapshot_bytes / 1e6,
-                    MIN_AUX_STATE_SLOTS,
-                )
-            kv_budget = max(kv_budget - aux_budget, 0)
-            self._aux_state_budget_bytes = aux_budget
-            self.aux_state_slots = slots
-            logger.info(
-                "Per-request footprint: snapshot %.1f MB, live attention KV %.1f MB; "
-                "%d snapshot slots",
-                snapshot_bytes / 1e6,
-                live_kv_bytes / 1e6,
-                slots,
-            )
-            self._snapshot_bytes = snapshot_bytes
+            slots = aux_budget // max(snapshot_bytes, 1)
             # A running request holds a live and a tracked snapshot slot and its
             # KV cache: bound the running requests by the reserve and by the slots.
             self.max_live_requests = max(
-                1, min(live_reserve // max(live_kv_bytes, 1), slots // 2)
+                1,
+                min(
+                    reserve_fixed // max(per_request, 1),
+                    max(slots, MIN_AUX_STATE_SLOTS) // 2,
+                ),
+            )
+            token_cap = self.max_live_requests * self._max_seq_len + reserve_growth // (
+                2 * bytes_per_slot
+            )
+            self._aux_state_budget_bytes = aux_budget
+            self._snapshot_bytes = snapshot_bytes
+            kv_budget -= aux_budget
+            logger.info(
+                "Per-request footprint: snapshot %.1f MB, live attention KV %.1f MB; "
+                "reserve %.2f GiB (1 - mem_fraction_static of the working set): "
+                "max_live_requests=%d, live-token bound %d",
+                snapshot_bytes / 1e6,
+                live_kv_bytes / 1e6,
+                reserve / 1024**3,
+                self.max_live_requests,
+                token_cap,
             )
         if explicit_size is not None:
+            if token_cap is not None and explicit_size > token_cap:
+                logger.warning(
+                    "--max-total-tokens %d exceeds the %d live tokens the device "
+                    "reserve backs (each live token is also held in a request's "
+                    "contiguous cache); long-context concurrency is unbounded.",
+                    explicit_size,
+                    token_cap,
+                )
+            self._finish_aux_budget(0)
             return explicit_size
         pool_size = max(kv_budget // bytes_per_slot, 256)
+        if token_cap is not None and pool_size > token_cap:
+            pool_size = max(token_cap, 256)
+            leftover = kv_budget - pool_size * bytes_per_slot
+        self._finish_aux_budget(leftover)
         logger.info(
             f"Auto-sized attention KV pool: "
             f"aux_state_budget={(self._aux_state_budget_bytes or 0) / (1024**3):.2f} GiB, "
@@ -791,6 +832,26 @@ class MlxModelRunner:
             f"bytes_per_slot={bytes_per_slot}, pool_size={pool_size}"
         )
         return pool_size
+
+    def _finish_aux_budget(self, leftover_bytes: int) -> None:
+        """Hand what the live-token bound leaves of the KV share to the snapshots."""
+        if self._aux_state_budget_bytes is None:
+            return
+        self._aux_state_budget_bytes += max(leftover_bytes, 0)
+        backed = self._aux_state_budget_bytes // max(self._snapshot_bytes, 1)
+        if backed < MIN_AUX_STATE_SLOTS:
+            logger.warning(
+                "The auxiliary-state budget (%.2f GiB) backs fewer than %d "
+                "snapshots of %.1f MB; the pool keeps %d slots.",
+                self._aux_state_budget_bytes / 1024**3,
+                MIN_AUX_STATE_SLOTS,
+                self._snapshot_bytes / 1e6,
+                MIN_AUX_STATE_SLOTS,
+            )
+        self.aux_state_slots = max(backed, MIN_AUX_STATE_SLOTS)
+        self.max_live_requests = max(
+            1, min(self.max_live_requests, self.aux_state_slots // 2)
+        )
 
     @property
     def pool_size(self) -> int:
