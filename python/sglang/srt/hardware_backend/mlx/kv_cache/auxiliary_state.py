@@ -43,19 +43,21 @@ def _clone_tree(value: Any) -> Any:
 
 
 def _arrays_in_tree(value: Any) -> list[mx.array]:
+    # No self-referencing closure here: a nested ``collect`` that calls itself is a
+    # reference cycle (function <-> its cell), so every call left its list of
+    # arrays -- the state of a snapshot -- alive until the cyclic garbage collector
+    # ran, which does not know about device memory. Evicting a snapshot then freed
+    # nothing, and a burst of long requests ran the device out of memory.
     arrays: list[mx.array] = []
-
-    def collect(item: Any) -> None:
+    pending = [value]
+    while pending:
+        item = pending.pop()
         if isinstance(item, mx.array):
             arrays.append(item)
         elif isinstance(item, (list, tuple)):
-            for child in item:
-                collect(child)
+            pending.extend(reversed(item))
         elif isinstance(item, dict):
-            for child in item.values():
-                collect(child)
-
-    collect(value)
+            pending.extend(reversed(list(item.values())))
     return arrays
 
 
