@@ -266,6 +266,15 @@ class TestRunnerBudget(unittest.TestCase):
         self.assertEqual(tokens, 65536)
         self.assertEqual(warned, [])
 
+    def test_one_token_below_the_token_threshold_warns(self):
+        runner = self._runner(snapshot=1 * MIB)
+        runner._mem_fraction_static = 1.0
+
+        tokens, warned = self._warns(runner, limit=21761167631)
+
+        self.assertEqual(tokens, 65535)
+        self.assertEqual(len(warned), 1)
+
     def test_a_roomy_budget_does_not_warn(self):
         runner = self._runner()
 

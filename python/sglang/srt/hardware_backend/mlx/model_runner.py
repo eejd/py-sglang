@@ -728,13 +728,24 @@ class MlxModelRunner:
         * what ``mem_fraction_static`` does not commit stays free headroom for
           activations and the allocator.
 
-        Worst case on Qwen3.5-4B (51.8 GiB working set, defaults): 402 snapshots
-        (20.7 GB) + one request of 131073 tokens (capacity 262144 = 8.6 GB, 12.9 GB
-        while growing) + the KV pool + 23 short requests with their live states +
-        weights is about 45 GB of 55.6 GB. A snapshot-dense saturation (756
-        single-chunk prompts) followed by a 133k-token prompt killed the previous
-        sizing at 54.6 GB, which gave the leftover of the token bound to the
-        snapshots.
+        Worst case for DISTINCT prompts on Qwen3.5-4B (51.8 GiB working set,
+        defaults): 402 snapshots (20.7 GB) + one request of 131073 tokens
+        (capacity 262144 = 8.6 GB, 12.9 GB while growing) + the KV pool + 23 short
+        requests with their live states + weights is about 45 GB of 55.6 GB. A
+        snapshot-dense saturation (756 single-chunk prompts) followed by a
+        133k-token prompt killed the previous sizing at 54.6 GB, which gave the
+        leftover of the token bound to the snapshots.
+
+        NOT covered: requests that reuse a cached prefix. The token bound counts
+        the pool's unique tokens, but a request that hits the radix tree gathers
+        its prefix into a PRIVATE contiguous cache (``_materialize_pool_backed_
+        attention``), so N requests sharing a P-token prefix cost the pool P tokens
+        once and N x capacity(P) bytes in caches; and the prefix-hit prefill itself
+        peaks far above that: one request with a 28.7k-token cached prefix and a
+        3.4k-token suffix peaked 30 GB above an idle engine, which an engine
+        saturated with snapshots (28 GB) cannot take (py-sglang#13). Partial hits
+        on long prefixes are therefore unsafe with the radix cache on; whole-prompt
+        repeats and distinct prompts are measured safe.
         """
         self._aux_state_budget_bytes: int | None = None
         self._snapshot_bytes: int | None = None
@@ -857,8 +868,7 @@ class MlxModelRunner:
         return pool_size
 
     def _finish_aux_budget(self) -> None:
-        """Turn the snapshot budget into slots (with the floor) and re-bound the
-        running requests by them."""
+        """Turn the snapshot budget into slots (with the floor)."""
         if self._aux_state_budget_bytes is None:
             return
         backed = self._aux_state_budget_bytes // max(self._snapshot_bytes, 1)
@@ -872,9 +882,6 @@ class MlxModelRunner:
                 MIN_AUX_STATE_SLOTS,
             )
         self.aux_state_slots = max(backed, MIN_AUX_STATE_SLOTS)
-        self.max_live_requests = max(
-            1, min(self.max_live_requests, self.aux_state_slots // 2)
-        )
 
     @property
     def pool_size(self) -> int:
