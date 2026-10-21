@@ -384,5 +384,44 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
         self.assertEqual(stub.req_to_token_pool.auxiliary_state_pool.size, 2 * RATIO)
 
 
+@unittest.skipUnless(_HAS_MLX, "requires mlx")
+class TestMlxStubModelContext(CustomTestCase):
+    """Every launch runs ``EagerRunner.warmup`` (``capture_cuda_graphs`` builds the
+    eager runner even with ``--disable-cuda-graph``), which enters
+    ``BaseRunner.model_context()``; since upstream sgl-project/sglang#44913 that
+    reads ``model_runner.model.shared_experts_config``. The stub's dummy model had no
+    such attribute and v0.5.22-local01 did not start any MLX model
+    (eejd/py-sglang#20)."""
+
+    def _stub_with_loaded_model(self):
+        stub = _hybrid_stub_for_initialize(
+            max_running_requests=2, max_mamba_cache_size=None
+        )
+        stub.load_model()
+        return stub
+
+    def test_the_eager_runner_warms_up_on_the_stub_model(self):
+        from sglang.srt.model_executor.runner.eager_runner import EagerRunner
+
+        stub = self._stub_with_loaded_model()
+        runner = EagerRunner.__new__(EagerRunner)
+        runner.model_runner = stub
+
+        with get_context().override_server_args():
+            runner.warmup()
+
+        self.assertTrue(stub._kernel_warmed_up)
+
+    def test_the_stub_model_has_no_shared_experts(self):
+        stub = self._stub_with_loaded_model()
+
+        config = stub.model.shared_experts_config
+
+        self.assertEqual(
+            (config.fusion_disabled, config.num_fused_shared_experts), (False, 0)
+        )
+        self.assertEqual(config.num_shared_topk_slots, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
