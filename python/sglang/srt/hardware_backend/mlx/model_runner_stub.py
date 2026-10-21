@@ -13,6 +13,9 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
     MlxAuxiliaryStateReqToTokenPool,
 )
+from sglang.srt.hardware_backend.mlx.kv_cache.private_cache_admission import (
+    MlxTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -140,6 +143,9 @@ class MlxModelRunnerStub(ModelRunner):
     # Set by the worker from the runner's device-memory budget of running requests.
     _mlx_max_live_requests: int | None = None
     _mlx_aux_state_slots: int | None = None
+    _mlx_private_cache_budget_tokens: int | None = None
+    _mlx_private_cache_tokens_in_use = None
+    _mlx_private_cache_base: int = 4096
 
     def __init__(
         self,
@@ -147,12 +153,18 @@ class MlxModelRunnerStub(ModelRunner):
         mlx_pool_size: int | None = None,
         mlx_max_live_requests: int | None = None,
         mlx_aux_state_slots: int | None = None,
+        mlx_private_cache_budget_tokens: int | None = None,
+        mlx_private_cache_tokens_in_use=None,
+        mlx_private_cache_base: int = 4096,
         **kwargs,
     ):
         self.validate_startup_weight_load_mode()
         self._mlx_pool_size = mlx_pool_size
         self._mlx_max_live_requests = mlx_max_live_requests
         self._mlx_aux_state_slots = mlx_aux_state_slots
+        self._mlx_private_cache_budget_tokens = mlx_private_cache_budget_tokens
+        self._mlx_private_cache_tokens_in_use = mlx_private_cache_tokens_in_use
+        self._mlx_private_cache_base = mlx_private_cache_base
         super().__init__(*args, **kwargs)
 
     def load_model(self):
@@ -341,13 +353,23 @@ class MlxModelRunnerStub(ModelRunner):
             device="cpu",
         )
         self.token_to_kv_pool = dummy_kv
-        self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+        allocator_args = dict(
             size=self.max_total_num_tokens,
             dtype=self.kv_cache_dtype,
             device="cpu",
             kvcache=dummy_kv,
             need_sort=False,
         )
+        if self._mlx_private_cache_budget_tokens is not None:
+            # Running requests' private attention caches are bounded at admission.
+            self.token_to_kv_pool_allocator = MlxTokenToKVPoolAllocator(
+                private_budget_tokens=self._mlx_private_cache_budget_tokens,
+                private_tokens_in_use=self._mlx_private_cache_tokens_in_use,
+                private_cache_base=self._mlx_private_cache_base,
+                **allocator_args,
+            )
+        else:
+            self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(**allocator_args)
 
         # No CUDA graphs, no attention backend
         self.decode_cuda_graph_runner = None

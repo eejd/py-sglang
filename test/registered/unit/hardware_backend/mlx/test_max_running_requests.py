@@ -279,6 +279,39 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
         self.assertEqual(stub.max_running_requests, 3)
         self.assertEqual(stub.req_to_token_pool.auxiliary_state_pool.size, 3)
 
+    def _initialized_with_private_budget(self, budget):
+        stub = _hybrid_stub_for_initialize(
+            max_running_requests=2, max_mamba_cache_size=None
+        )
+        stub._mlx_private_cache_budget_tokens = budget
+        stub._mlx_private_cache_tokens_in_use = lambda: 0
+        stub._mlx_private_cache_base = 4096
+        with _arch(hybrid=True), _published(stub):
+            stub.initialize()
+        return stub
+
+    def test_a_budgeted_hybrid_stub_gets_the_bounding_allocator(self):
+        from sglang.srt.hardware_backend.mlx.kv_cache.private_cache_admission import (
+            MlxTokenToKVPoolAllocator,
+        )
+
+        stub = self._initialized_with_private_budget(32_768)
+
+        allocator = stub.token_to_kv_pool_allocator
+        self.assertIsInstance(allocator, MlxTokenToKVPoolAllocator)
+        self.assertEqual(allocator.private_budget_tokens, 32_768)
+
+    def test_without_a_budget_the_plain_allocator_is_kept(self):
+        from sglang.srt.hardware_backend.mlx.kv_cache.private_cache_admission import (
+            MlxTokenToKVPoolAllocator,
+        )
+
+        stub = self._initialized_with_private_budget(None)
+
+        self.assertNotIsInstance(
+            stub.token_to_kv_pool_allocator, MlxTokenToKVPoolAllocator
+        )
+
     def test_aux_pool_has_the_slots_the_memory_budget_backs(self):
         # The runner measured how many snapshots the budget holds: the pool gets
         # them, not max_running_requests x ratio (which the live clamp made tiny).

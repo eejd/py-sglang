@@ -66,6 +66,7 @@ class _FakeRunner:
         self.logits_flags: dict[tuple[str, str], bool] = {}
         self.prefix_slot_ids: dict[str, list[int]] = {}
         self._req_caches: dict[str, list] = {}
+        self.released: set[str] = set()
         self._counter = 0
 
     # --- shared ---
@@ -75,6 +76,10 @@ class _FakeRunner:
     def remove_request(self, rid):
         self.calls.append(("remove_request", rid))
         self._known.discard(rid)
+        self.released.discard(rid)
+
+    def released_request_ids(self):
+        return set(self.released)
 
     def ops_for(self, rid):
         return [op for op, r in self.calls if r == rid]
@@ -387,6 +392,36 @@ class TestMlxExtendRouting(CustomTestCase):
         worker._async_extend_batch(batch)
 
         self.assertEqual(calls, [("copy_from", [5], [7]), ("prefill_start",)])
+
+    def test_a_prefill_launch_frees_the_state_of_finished_requests(self):
+        """A finished request never runs again; its contiguous cache (up to 8.6 GB)
+        was freed only by the next DECODE launch, so an engine whose next launch
+        was a prefill kept it (py-sglang#15)."""
+        worker = self._worker(known_rids={"gone", "other"})
+        worker._mlx_runner.released = {"gone"}
+        worker._mlx_active_rids = {"gone", "other"}
+        worker._req_retraction_count = {"gone": 0}
+
+        worker.async_forward_batch_generation_mlx(
+            _FakeBatch(ForwardMode.EXTEND, [_FakeReq("r1", req_pool_idx=1)], [2])
+        )
+
+        self.assertEqual(worker._mlx_runner.ops_for("gone")[0], "remove_request")
+        self.assertNotIn("remove_request", worker._mlx_runner.ops_for("other"))
+        self.assertNotIn("gone", worker._mlx_active_rids)
+        self.assertNotIn("gone", worker._req_retraction_count)
+
+    def test_a_finished_request_that_is_in_the_extend_batch_is_kept(self):
+        # e.g. a retracted request re-prefilled: its old state is dropped by the
+        # retraction check, not here.
+        worker = self._worker(known_rids={"r1"})
+        worker._mlx_runner.released = {"r1"}
+
+        worker.async_forward_batch_generation_mlx(
+            _FakeBatch(ForwardMode.EXTEND, [_FakeReq("r1", req_pool_idx=1)], [2])
+        )
+
+        self.assertNotIn("remove_request", worker._mlx_runner.ops_for("r1"))
 
     def test_async_genuine_mixed_decode_routes_to_decode(self):
         p, d = _FakeReq("p1"), _FakeReq("d1")

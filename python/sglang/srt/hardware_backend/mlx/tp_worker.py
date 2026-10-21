@@ -117,6 +117,9 @@ class MlxTpModelWorker(TpModelWorker):
             mlx_pool_size=self._mlx_runner.pool_size,
             mlx_max_live_requests=self._mlx_runner.max_live_requests,
             mlx_aux_state_slots=self._mlx_runner.aux_state_slots,
+            mlx_private_cache_budget_tokens=self._mlx_runner.private_cache_budget_tokens,
+            mlx_private_cache_tokens_in_use=self._mlx_runner.private_cache_tokens_in_use,
+            mlx_private_cache_base=self._mlx_runner._max_seq_len,
         )
 
         self._mlx_active_rids: set[str] = set()
@@ -169,6 +172,13 @@ class MlxTpModelWorker(TpModelWorker):
             self._mlx_active_rids = current_rids
         else:
             self._mlx_active_rids |= current_rids
+            # A finished request's state is otherwise freed by the next DECODE
+            # launch only: an engine whose next launch is a prefill (or none) kept
+            # the last finished requests' contiguous caches, up to 8.6 GB each.
+            for rid in self._mlx_runner.released_request_ids() - current_rids:
+                self._mlx_runner.remove_request(rid)
+                self._req_retraction_count.pop(rid, None)
+                self._mlx_active_rids.discard(rid)
 
     def prepare_for_kv_cache_release(self, req) -> None:
         """Write the request's MLX state to the pool at the scheduler's radix

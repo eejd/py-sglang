@@ -92,6 +92,7 @@ def _stub_runner(model, disable_radix_cache, pool_size=64):
     runner._max_seq_len = 64
     runner._cache_pool = []
     runner._req_caches = {}
+    runner._prefill_caches = {}
     runner._req_token_ids = {}
     runner._req_sampling = {}
     runner._req_pool_idx = {}
