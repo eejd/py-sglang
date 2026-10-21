@@ -926,11 +926,16 @@ class MlxModelRunner:
             ]
         )
         self._attention_kv_pool.set_kv_all_layers(slot_ids_mx, k_all, v_all)
-        # The scatters are lazy and chain on the previous buffer versions: left
-        # unevaluated they keep every request's slice of its contiguous KV cache
-        # (4096-token chunks, ~130 MB per request on a 4B hybrid) alive, which on
-        # a long run is the device out of memory. Evaluating drops them.
-        mx.eval(*self._attention_kv_pool.all_buffers())
+        # The scatters are lazy and chain on the previous buffer versions, each
+        # holding the slice of the request's contiguous KV cache it copies from.
+        # A model with auxiliary state gets a new cache per request (_acquire_cache
+        # reuses caches only for models without it), so unevaluated the chain
+        # keeps every request's cache alive (~130 MB each on Qwen3.5-4B: the device
+        # out of memory after ~140 requests, py-sglang#11). Evaluating drops them.
+        # Dense models reuse their caches (flat memory over 500 distinct requests
+        # measured without it) and are spared the eval, which costs prefill latency.
+        if self._cache_layout.has_auxiliary_state:
+            mx.eval(*self._attention_kv_pool.all_buffers())
 
     def _sync_decode_kv_to_pool(self, req_id: str, end: int | None = None) -> None:
         """Sync un-flushed decode KV for *req_id* to the shared pool, up to

@@ -226,8 +226,8 @@ class TestRunnerBudget(unittest.TestCase):
         self.assertEqual(pool.auxiliary_state_pool.size, slots)
         self.assertLess(slots, 100_000)
 
-    def test_scatters_into_the_pool_are_materialised(self):
-        runner = self._runner()
+    def _sync(self, has_aux: bool):
+        runner = self._runner(has_aux=has_aux)
         runner._attention_kv_pool = MlxAttentionKVPool(
             pool_size=16, num_layers=1, n_kv_heads=1, head_dim=2, dtype=mx.float32
         )
@@ -240,12 +240,20 @@ class TestRunnerBudget(unittest.TestCase):
             "sglang.srt.hardware_backend.mlx.model_runner.mx.eval"
         ) as evaluate:
             runner._sync_new_kv_to_pool([_Attn()], 0, [3, 4])
-
         evaluated = [a for call in evaluate.call_args_list for a in call.args]
-        after = runner._attention_kv_pool.all_buffers()
-        self.assertEqual(len(evaluated), len(after))
-        for buffer in after:
+        return runner._attention_kv_pool.all_buffers(), evaluated
+
+    def test_scatters_into_the_pool_are_materialised_for_a_hybrid_model(self):
+        buffers, evaluated = self._sync(has_aux=True)
+
+        self.assertEqual(len(evaluated), len(buffers))
+        for buffer in buffers:
             self.assertTrue(any(buffer is a for a in evaluated))
+
+    def test_a_dense_model_keeps_its_lazy_scatters(self):
+        _, evaluated = self._sync(has_aux=False)
+
+        self.assertEqual(evaluated, [])
 
 
 @unittest.skipUnless(_HAS_MLX, "requires mlx")
