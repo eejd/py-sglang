@@ -1,0 +1,89 @@
+{
+ "2048": {
+  "reconstruction": {
+   "method": null,
+   "reconstruction_verified": null
+  },
+  "repeats": {
+   "1": {
+    "bodies_equal": false,
+    "body1_sha256": "5bd1637a4733b911514e4b216390b0142b9b32102fc104ac204580d35a5dbab9",
+    "body2_sha256": "16ed6f4029b08d4f20966ad30ef634efccb3e8556e95b7c2590a7d0777a1e5f8",
+    "common_token_prefix": 32,
+    "token_counts": [
+     2082,
+     2082
+    ]
+   },
+   "2": {
+    "bodies_equal": false,
+    "body1_sha256": "4f214ec89c141e8fee5294ad05fa7355c4c7a189d3eb8211610126f7f6751413",
+    "body2_sha256": "92a699e9fb97dc2a55cb20a69a3f25db23816f052fa2b51627e9b5699fddb6af",
+    "common_token_prefix": 32,
+    "token_counts": [
+     2082,
+     2082
+    ]
+   }
+  },
+  "sha256": "69b102c25a0d5f156061b8fd41e07aedcda1cb79086cae40ae0fb1c7c07218e5"
+ },
+ "16384": {
+  "reconstruction": {
+   "method": null,
+   "reconstruction_verified": null
+  },
+  "repeats": {
+   "1": {
+    "bodies_equal": false,
+    "body1_sha256": "5829d057b683140290fd9472c469558c5111b73c4cfe39c0daa8bd36d506403d",
+    "body2_sha256": "9c68bf2e43dc7ef09cdb69cdcd2718fa69abd2a2b661de16cce1817ce5f67449",
+    "common_token_prefix": 32,
+    "token_counts": [
+     16418,
+     16418
+    ]
+   },
+   "2": {
+    "bodies_equal": false,
+    "body1_sha256": "43317d935e94206b6e7f9f34521cf8d613ef592e74394b7611fe0cc9ec38855a",
+    "body2_sha256": "7d21f0f111e79b49750a641f37b48dc9076abe20224f1615a360aba1a1853aca",
+    "common_token_prefix": 32,
+    "token_counts": [
+     16418,
+     16418
+    ]
+   }
+  },
+  "sha256": "0253c860fcb629097d4c411228ab681c077ce4ed816dc264536f4046ca72af80"
+ },
+ "32768": {
+  "reconstruction": {
+   "method": "direct_generator_matches_recorded_qb_request1",
+   "reconstruction_verified": true
+  },
+  "repeats": {
+   "1": {
+    "bodies_equal": false,
+    "body1_sha256": "aebed1c25e2327c3e064a8992b9ee41bcf4c77928fded0d51736729a584e4f10",
+    "body2_sha256": "20e6163db3794cd4789099b356cae8466cab5381e33bd053eac6a1d9d7aea4a7",
+    "common_token_prefix": 32,
+    "token_counts": [
+     32802,
+     32802
+    ]
+   },
+   "2": {
+    "bodies_equal": false,
+    "body1_sha256": "47ff07ea2dd728dbb05981df8a7b92075a73e1c2a1e532344cb5e54a45cdcbe2",
+    "body2_sha256": "cbba0c5a1bcac186132de036175dd5cfd3db39d8e414f1282eb65d2977791c43",
+    "common_token_prefix": 32,
+    "token_counts": [
+     32802,
+     32802
+    ]
+   }
+  },
+  "sha256": "14ccca56e897317650119919ad97252150e9e4894366e145cd7a518ef1d4a284"
+ }
+}

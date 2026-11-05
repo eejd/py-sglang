@@ -1,0 +1,30 @@
+## Upstream position
+
+**[Inference] The observed radix-on memory growth is inconsistent with upstream’s stated goal of safe, useful Apple Silicon memory management, but the material reviewed does not establish that `--max-total-tokens` was ever promised as a whole-process memory limit.** Upstream explicitly recognizes that shared-pool sizing, private caches, prefill transients, and allocator cache are different concerns. Its Apple roadmap still lists UMA memory management as unfinished. [Roadmap #19137](https://github.com/sgl-project/sglang/issues/19137), [memory issue #21443](https://github.com/sgl-project/sglang/issues/21443).
+
+| Evidence | What it establishes |
+|---|---|
+| [MLX runner PR #20342](https://github.com/sgl-project/sglang/pull/20342), merged March 26 | @yeahdongcn introduced the native MLX runner while retaining SGLang’s scheduler/worker integration. |
+| [Radix PR #21509](https://github.com/sgl-project/sglang/pull/21509), merged April 17 | Its stated goals were feature parity and faster shared-prefix prefill. It introduced the shared MLX pool, contiguous per-request decode caches, and prefill pool synchronization. |
+| [UMA issue #21443](https://github.com/sgl-project/sglang/issues/21443), March 26 | @yeahdongcn requested a Metal-working-set guardrail, citing paging, instability, and experienced reboots when memory is overcommitted. |
+| [Radix-off OOM PR #29439](https://github.com/sgl-project/sglang/pull/29439), closed **unmerged** October 26 | @LarrySimingDeng proposed budgeting private caches, prefill headroom and concurrency; the proposal explicitly left radix-on behavior unchanged. |
+| [MLX cache PR #41209](https://github.com/sgl-project/sglang/pull/41209), open | @luke-edward proposed a default recycled-buffer-cache cap and explicitly said that it does **not** bound the live working set. |
+
+### Design and maintainer statements
+
+- In [#21509](https://github.com/sgl-project/sglang/pull/21509), @yeahdongcn explained on April 7 that the scheduler’s radix trie and token allocator were intended to remain reused, with MLX as the data-store consumer. Automatic pool sizing divides the remaining budget by KV bytes per slot; this avoids manually tuning `--max-total-tokens`. Prefill writes new KV to the pool, while per-request contiguous buffers support decode.
+- On April 9, after @hnyls2002 identified a stale-prefix correctness problem, @yeahdongcn acknowledged it and explained that `mx.eval()` was expensive: decode synchronization was moved to immediately before a subsequent pool read rather than performed every decode step. This discussion establishes a **performance/correctness trade-off**, not acceptance of unbounded lazy-scatter retention. [#21509](https://github.com/sgl-project/sglang/pull/21509).
+- The [roadmap](https://github.com/sgl-project/sglang/issues/19137) calls the original support proof-of-concept and tracks native MLX, radix caching, unfinished UMA management, and future Metal paged attention. It also identifies silent drift between the MLX runner stub and framework assumptions. I did **not** find a maintainer declaration that the particular memory growth is an accepted limit or a quantified process-footprint target. The [Apple guide](https://docs.sglang.io/docs/hardware-platforms/apple_metal) describes the runtime but does not label it experimental in the text reviewed.
+
+### Related upstream memory work
+
+- [#29439](https://github.com/sgl-project/sglang/pull/29439) reports a radix-**off** long-prompt/concurrency OOM, proposes a measured prefill probe and private-cache-based admission, and reports an independently exercised 24 GB configuration. Its author’s 64–512 GB projections were **mock simulations**, not large-Mac measurements. This does not fix or validate our radix-on case.
+- [#39675](https://github.com/sgl-project/sglang/issues/39675) reports an MPS capacity-reporting omission leading to a `0.95` static fraction and prefill OOM. [#41264](https://github.com/sgl-project/sglang/pull/41264), still open, proposes last-position-only logits and reports lower peaks; it is separate from budgeting and does not prove logits caused our growth.
+- [#29949](https://github.com/sgl-project/sglang/pull/29949), open, proposes unified MLX/torch-MPS memory reporting. On July 3 @yeahdongcn endorsed the torch-MPS direction and requested backend-specific reporting semantics. Its author notes MLX counters alone cannot see torch-side allocations.
+- [#28160](https://github.com/sgl-project/sglang/pull/28160), merged June 14, made decode cache-clearing frequency configurable. It addresses allocator cache, not necessarily live graph references.
+
+### Fork findings and search limits
+
+The owner’s tracker is **not upstream**. Fork [#11](https://github.com/eejd/py-sglang/issues/11) reports hybrid lazy-scatter retention and an evaluated-pool intervention; [#13](https://github.com/eejd/py-sglang/issues/13) corrects its initial prefix-transient hypothesis to a missing hybrid state restore; [#15](https://github.com/eejd/py-sglang/issues/15) tracks private copies and admission; [#24](https://github.com/eejd/py-sglang/issues/24) tracks dense budgeting; and [#25](https://github.com/eejd/py-sglang/issues/25) tracks dense lazy-version lifetime. #25 explicitly corrects its earlier claim that *no other engine* has this defect: only inspected paths were compared.
+
+Searches of upstream issues/PRs for MLX memory, scatter, private cache, Apple/MPS and OOM, plus the roadmap and linked discussions, found **no upstream issue or maintainer acceptance specifically identifying the dense per-chunk scatter-version chain**; this is a search result, not proof none exists. For a non-CUDA comparison, [NPU issue #20169](https://github.com/sgl-project/sglang/issues/20169) reports prefill OOM; @qinsir5522 advised reducing static memory fraction because static allocation and large prefill both consume memory. Its cause is not established as the MLX mechanism.
