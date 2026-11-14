@@ -23,7 +23,7 @@ from sglang.kernels.ops.attention.kv_indices import (
     create_flashinfer_kv_indices_triton,
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
-    kv_indices_num_token_blocks,
+    spec_kv_index_token_blocks,
 )
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -153,13 +153,6 @@ _MLA_REDUCE_V1_HEADS = {
 # fake non-ps, intra_batch_mode needs to be True for non-ps-mode
 fast_mode = False
 intra_batch_mode = True if _use_mla_ps_kernel else False
-
-
-# Token-block parallel KV-index building is enabled only where it pays:
-# the speculative-decoding paths (target_verify / draft_extend / draft
-# decode) of long-context servers. Everything else keeps the historical
-# one-program-per-request launch.
-_KV_INDEX_BLOCKS_MIN_CONTEXT = 32768
 
 
 class WrapperDispatch(Enum):
@@ -576,9 +569,9 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         self.scale = float(1.0 / (self.head_dim**0.5))
-        self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(
-            self.device
-        )
+        self.q_scale = self.k_scale = self.v_scale = torch.tensor(
+            [1.0], dtype=torch.float32
+        ).to(self.device)
 
         self.logits_soft_cap = 0.0
 
@@ -751,6 +744,21 @@ class AiterAttnBackend(AttentionBackend):
         if self.kv_cache_dtype != fp8_dtype:
             return "auto"
         return "fp8_e4m3"
+
+    def _quantize_q_fp8(self, q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize ``q`` to fp8 with the static q scale.
+
+        Returns ``(q_fp8, q_descale)``; ``q_descale`` must be passed as the
+        attention kernel's ``q_descale``. The KV cache ``k_scale`` is calibrated
+        for K, not q, so it cannot stand in for q's scale. The quant kernel
+        saturates, whereas ``.to(fp8)`` turns out-of-range values into NaN on
+        e4m3fnuz. ``q`` is often a strided view into the fused qkv output, and
+        the quant kernel reads its input as contiguous rows.
+        """
+        q_fp8, _ = scaled_fp8_quant(
+            q.reshape(q.shape[0], -1).contiguous(), self.q_scale
+        )
+        return q_fp8.view(q.shape), self.q_scale
 
     def _use_mla_decode_persist_metadata(self) -> bool:
         """Persist MLA metadata for non-DCP PS decode, or DCP ASM decode.
@@ -1209,10 +1217,6 @@ class AiterAttnBackend(AttentionBackend):
             bs, forward_batch.seq_lens, forward_batch.req_pool_indices, max_kv_len
         )
 
-        # Build cu_seqlens_q from this batch's extend lengths. The standard
-        # prefill metadata path leaves self.qo_indptr unset (qo_indptr=None in
-        # ForwardMetadata), so relying on it corrupts multi-sequence batches
-        # (only bs=1 happens to work).
         cu_seqlens_q = torch.zeros(bs + 1, dtype=torch.int32, device=q.device)
         cu_seqlens_q[1:] = torch.cumsum(
             forward_batch.extend_seq_lens.to(torch.int32), dim=0
@@ -1972,9 +1976,12 @@ class AiterAttnBackend(AttentionBackend):
         return output, final_lse
 
     def _kv_index_blocks(self, bs: int) -> int:
-        if self.max_context_len < _KV_INDEX_BLOCKS_MIN_CONTEXT:
-            return 1
-        return kv_indices_num_token_blocks(self.req_to_token.shape[1], bs)
+        return spec_kv_index_token_blocks(
+            self.req_to_token.shape[1],
+            kv_lens_sum=None,
+            batch_size=bs,
+            context_len=self.max_context_len,
+        )
 
     def init_forward_metadata_out_graph(
         self,
@@ -2598,7 +2605,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.forward_metadata = ForwardMetadata(
                     self.indices_updater_prefill.kv_indptr,
                     self.indices_updater_prefill.kv_indices,
-                    None,
+                    self.indices_updater_prefill.qo_indptr[: bs + 1],
                     None,
                     max(forward_batch.extend_seq_lens_cpu),
                     forward_batch.seq_lens_cpu.max().item(),
@@ -4423,7 +4430,7 @@ class AiterAttnBackend(AttentionBackend):
                         self.k_scale.reshape(1),  # Q is cast at unit scale.
                         k_descale.reshape(1),
                         v_descale.reshape(1),
-                        self.qo_indptr[:bs0],
+                        self.forward_metadata.qo_indptr[:bs0],
                         cu_k,
                         self.forward_metadata.max_q_len,
                         int(self.forward_metadata.max_kv_len),
@@ -4499,7 +4506,7 @@ class AiterAttnBackend(AttentionBackend):
                         fp8_q_descale.reshape(1),
                         k_descale.reshape(1),
                         v_descale.reshape(1),
-                        self.qo_indptr[:bs0],
+                        self.forward_metadata.qo_indptr[:bs0],
                         cu_k,
                         self.forward_metadata.max_q_len,
                         int(self.forward_metadata.max_kv_len),
@@ -4538,8 +4545,8 @@ class AiterAttnBackend(AttentionBackend):
                     fp8_q_descale.reshape(1),
                     k_descale.reshape(1),
                     v_descale.reshape(1),
-                    self.qo_indptr[:bs0],
-                    self.qo_indptr[:bs0],
+                    self.forward_metadata.qo_indptr[:bs0],
+                    self.forward_metadata.qo_indptr[:bs0],
                     self.forward_metadata.max_q_len,
                     self.forward_metadata.max_q_len,
                     softmax_scale=layer.scaling,
@@ -4580,8 +4587,7 @@ class AiterAttnBackend(AttentionBackend):
             # NHD path — original aiter paged batch_prefill.
             # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
             if self.kv_cache_dtype == fp8_dtype:
-                q = q.to(fp8_dtype)
-                q_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+                q, q_descale = self._quantize_q_fp8(q)
 
             k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
@@ -4628,7 +4634,7 @@ class AiterAttnBackend(AttentionBackend):
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache,
                 v_cache,
-                self.qo_indptr[:bs0],
+                self.forward_metadata.qo_indptr[:bs0],
                 kv_indptr_arg,
                 page_table,
                 self.forward_metadata.max_q_len,
@@ -4822,10 +4828,7 @@ class AiterAttnBackend(AttentionBackend):
                     return o
                 q_descale = None
                 if self.kv_cache_dtype == fp8_dtype:
-                    q_descale = (
-                        layer.k_scale if layer.k_scale is not None else self.k_scale
-                    )
-                    q, _ = scaled_fp8_quant(q, q_descale)
+                    q, q_descale = self._quantize_q_fp8(q)
 
                 unified_attention(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -4844,7 +4847,7 @@ class AiterAttnBackend(AttentionBackend):
                     causal=True,
                     window_size=window_size,
                     block_table=page_table,
-                    softcap=0,
+                    softcap=layer.logit_cap,
                     q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
@@ -4873,8 +4876,8 @@ class AiterAttnBackend(AttentionBackend):
                     aiter_kv_str,
                     "NHD",
                     self.logits_soft_cap,
-                    self.k_scale,
-                    self.v_scale,
+                    k_descale if k_descale is not None else self.k_scale,
+                    v_descale if v_descale is not None else self.v_scale,
                     None,
                     _AITER_PARTITION_SIZE_ROCM,
                 )
@@ -5129,12 +5132,12 @@ class AiterMultiStepDraftBackend:
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
 
-        num_token_blocks = (
-            kv_indices_num_token_blocks(
-                self.pool_len, self.speculative_num_steps * num_seqs * self.topk
-            )
-            if self.max_context_len >= _KV_INDEX_BLOCKS_MIN_CONTEXT
-            else 1
+        num_token_blocks = spec_kv_index_token_blocks(
+            self.pool_len,
+            kv_lens_sum=None,
+            batch_size=num_seqs,
+            base_programs=self.speculative_num_steps * num_seqs * self.topk,
+            context_len=self.max_context_len,
         )
         src = self.kv_index_translator.read_source(
             forward_batch.kv_loc_plan,

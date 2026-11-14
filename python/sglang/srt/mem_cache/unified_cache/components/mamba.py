@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import replace
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -40,6 +39,9 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     PreparePrefetchResult,
     TreeComponent,
     get_and_increase_time_counter,
+)
+from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    BaseEvictionResult,
 )
 from sglang.srt.runtime_context import (
     get_exec,
@@ -272,6 +274,7 @@ class MambaComponent(TreeComponent):
         tail: UnifiedTreeNode,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Evict shallow eligible device checkpoints beyond the path cap.
 
@@ -311,8 +314,16 @@ class MambaComponent(TreeComponent):
                 host_frees,
                 target=EvictLayer.DEVICE,
                 tracker=tracker,
+                cache_actions=cache_actions,
             )
-            self.tree_core._cascade_evict(node, self, tracker, device_frees, host_frees)
+            self.tree_core._cascade_evict(
+                node,
+                self,
+                tracker,
+                device_frees,
+                host_frees,
+                cache_actions=cache_actions,
+            )
             excess -= 1
 
     def redistribute_on_node_split(
@@ -332,6 +343,7 @@ class MambaComponent(TreeComponent):
         node: UnifiedTreeNode,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
         target: EvictLayer = EvictLayer.DEVICE,
     ) -> tuple[int, int]:
         cd = node.component_data[self.component_type]
@@ -382,6 +394,7 @@ class MambaComponent(TreeComponent):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> NodeId | InternalStateBackup | None:
         """Advance one device-eviction step and return a leaf, if selected.
 
@@ -436,9 +449,15 @@ class MambaComponent(TreeComponent):
             tracker=tracker,
             device_frees=device_frees,
             host_frees=host_frees,
+            cache_actions=cache_actions,
         )
         self.tree_core._cascade_evict(
-            x, self, tracker, device_frees=device_frees, host_frees=host_frees
+            x,
+            self,
+            tracker,
+            device_frees=device_frees,
+            host_frees=host_frees,
+            cache_actions=cache_actions,
         )
         if enabled:
             self._evict_device_cursor = lru.cursor_next()
@@ -1003,6 +1022,7 @@ class MambaComponent(TreeComponent):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Evict mamba host resources.
         Internal nodes: private tombstone (free host mamba only).
@@ -1023,7 +1043,9 @@ class MambaComponent(TreeComponent):
                 not enabled or self._can_evict_leaf_atomically(x)
             ):
                 # Host leaf: atomic eviction (all components host + delete)
-                self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
+                self.tree_core._evict_host_leaf(
+                    x, tracker, device_frees, host_frees, cache_actions=cache_actions
+                )
             else:
                 # Internal (or a leaf a session still pins): tombstone Mamba + cascade
                 assert cd.host_value is not None
@@ -1034,6 +1056,7 @@ class MambaComponent(TreeComponent):
                     tracker=tracker,
                     device_frees=device_frees,
                     host_frees=host_frees,
+                    cache_actions=cache_actions,
                 )
                 self.tree_core._cascade_evict(
                     x,
@@ -1042,6 +1065,7 @@ class MambaComponent(TreeComponent):
                     device_frees=device_frees,
                     host_frees=host_frees,
                     target=EvictLayer.HOST,
+                    cache_actions=cache_actions,
                 )
                 self.tree_core._update_evictable_leaf_sets(x)
             if enabled:
@@ -1059,16 +1083,18 @@ class MambaComponent(TreeComponent):
 
     def apply_component_action(self, action: ComponentAction) -> None:
         if isinstance(action, MambaEvictExcessPathStates):
-            device_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
-            host_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
+            result = BaseEvictionResult()
             # Drain even if the walk raises so tombstoned slots are not leaked;
             # the walk runs behind the tree-core interface (Rust runs it natively).
             try:
                 self.tree_core.evict_excess_path_states(
-                    action.tail_node_id, device_frees, host_frees
+                    action.tail_node_id,
+                    result.device_frees,
+                    result.host_frees,
+                    result.cache_actions,
                 )
             finally:
-                self.cache._free_values(device_frees, host_frees)
+                self.cache._apply_eviction_result(result)
             return
         if isinstance(action, FreeComponentDeviceSlot):
             for indices in action.indices:
