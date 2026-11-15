@@ -19,15 +19,28 @@ from sglang.srt.utils.common import is_host_cpu_arm64
 
 logger = logging.getLogger(__name__)
 
+_gloo_loopback_installed = False
+
 
 def handle_hardware_runtime_validation(server_args: Any):
-    # `server_args` is accepted, not read: every resolution-hook step takes
-    # it, uniformly, so `run_hook` never has to special-case an arity. The
-    # check below is intentionally independent of `server_args.device`:
-    # setting SGLANG_USE_MLX opts into the MLX backend and must fail
-    # immediately if the environment cannot honor that request. With the
-    # flag unset, use_mlx() remains lazy and does not import MLX.
-    use_mlx()
+    # Validate even when device selection has not yet resolved.
+    mlx = use_mlx()
+    global _gloo_loopback_installed
+    local_only = (
+        mlx
+        and server_args.tp_size == 1
+        and server_args.pp_size == 1
+        and server_args.dp_size == 1
+        and server_args.nnodes == 1
+    )
+    if local_only and "GLOO_SOCKET_IFNAME" not in os.environ:
+        # Avoid gloo's potentially slow hostname lookup on single-host MLX.
+        os.environ["GLOO_SOCKET_IFNAME"] = "lo0"
+        _gloo_loopback_installed = True
+    elif not local_only and _gloo_loopback_installed:
+        if os.environ.get("GLOO_SOCKET_IFNAME") == "lo0":
+            del os.environ["GLOO_SOCKET_IFNAME"]
+        _gloo_loopback_installed = False
 
 
 def handle_npu_backends(server_args: Any):

@@ -37,6 +37,26 @@ def _has_supported_mlx() -> bool:
 
 
 class TestMlxRuntime(unittest.TestCase):
+    def test_gloo_loopback_default_and_topology(self):
+        from sglang.srt.arg_groups import platform_hook
+
+        args = types.SimpleNamespace(tp_size=1, pp_size=1, dp_size=1, nnodes=1)
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            platform_hook, "use_mlx", return_value=True
+        ), mock.patch.object(platform_hook, "_gloo_loopback_installed", False, create=True):
+            platform_hook.handle_hardware_runtime_validation(args)
+            self.assertEqual(os.environ["GLOO_SOCKET_IFNAME"], "lo0")
+            args.dp_size = 2
+            platform_hook.handle_hardware_runtime_validation(args)
+            self.assertNotIn("GLOO_SOCKET_IFNAME", os.environ)
+            os.environ["GLOO_SOCKET_IFNAME"] = "en0"
+            args.dp_size = 1
+            platform_hook.handle_hardware_runtime_validation(args)
+            self.assertEqual(os.environ["GLOO_SOCKET_IFNAME"], "en0")
+            args.nnodes = 2
+            platform_hook.handle_hardware_runtime_validation(args)
+            self.assertEqual(os.environ["GLOO_SOCKET_IFNAME"], "en0")
+
     def test_disabled_backend_does_not_import_mlx(self):
         script = """
 import sys
