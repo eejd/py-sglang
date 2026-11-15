@@ -74,6 +74,11 @@ SGLANG_USE_MLX=1 python -m sglang.launch_server \
 5. `SGLANG_MLX_FUSE_SWIGLU=1` - Enables the use of fused Swish-Gated Linear Unit kernel (disabled by default)
 6. `SGLANG_MLX_CLEAR_CACHE_STEPS=256` - Sets the number of decode steps before clearing the MLX cache (256 by default)
 
+For single-node MLX serving with TP, PP and DP all set to 1, SGLang defaults
+`GLOO_SOCKET_IFNAME` to `lo0` to avoid slow hostname resolution during gloo
+initialization. An explicitly set value is always respected; other topologies
+use gloo's default interface selection.
+
 ## Quantization
 
 The MLX backend supports two quantization paths on Apple Silicon:
