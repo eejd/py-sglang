@@ -88,9 +88,8 @@ class _DummyModel:
     """Minimal stand-in so that `inspect.signature(model.forward)` and
     `getattr(model, ...)` calls in ModelRunner.__init__ don't crash."""
 
-    # The layout every model owns: ``BaseRunner.model_context`` (run by
-    # ``EagerRunner.warmup`` on every launch, MLX included) reads it from
-    # ``model_runner.model``, and the real loader sets it. No shared experts here.
+    # The model loader sets this on every Torch model, and the graph runners
+    # read it during warmup. No Torch MoE layers exist here, so nothing is fused.
     shared_experts_config = SharedExpertsConfig()
 
     @staticmethod
@@ -390,7 +389,7 @@ class MlxModelRunnerStub(ModelRunner):
             f"zero GPU KV cache allocation)"
         )
 
-    def alloc_memory_pool(self, memory_pool_config=None):
+    def alloc_memory_pool(self, memory_pool_config=None, *, draft_parallel_layout=None):
         """No-op: MLX manages its own KV cache."""
         pass
 
