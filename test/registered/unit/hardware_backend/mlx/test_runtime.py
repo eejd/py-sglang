@@ -44,6 +44,9 @@ class TestMlxRuntime(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
             platform_hook, "use_mlx", return_value=True
         ), mock.patch.object(platform_hook, "_gloo_loopback_installed", False, create=True):
+            with mock.patch.object(platform_hook, "use_mlx", return_value=False):
+                platform_hook.handle_hardware_runtime_validation(args)
+                self.assertNotIn("GLOO_SOCKET_IFNAME", os.environ)
             platform_hook.handle_hardware_runtime_validation(args)
             self.assertEqual(os.environ["GLOO_SOCKET_IFNAME"], "lo0")
             args.dp_size = 2
