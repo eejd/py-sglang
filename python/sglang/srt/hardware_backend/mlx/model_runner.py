@@ -89,6 +89,38 @@ from sglang.srt.runtime_context import (
 
 logger = logging.getLogger(__name__)
 
+
+def _apply_wired_limit() -> None:
+    """Pin MLX allocations to prevent OS paging, as SGLANG_MLX_WIRED_LIMIT_GB says.
+
+    Unset wires the recommended working set; 0 sets no limit; N wires N GiB,
+    capped at the recommended size.
+    """
+    max_wired = int(mx.device_info().get("max_recommended_working_set_size", 0))
+    limit_gb = envs.SGLANG_MLX_WIRED_LIMIT_GB.get()
+    if limit_gb is None:
+        wired = max_wired
+    elif limit_gb < 0:
+        raise ValueError(f"SGLANG_MLX_WIRED_LIMIT_GB must be >= 0, got {limit_gb}")
+    elif limit_gb == 0:
+        logger.info("MLX wired limit not set (SGLANG_MLX_WIRED_LIMIT_GB=0)")
+        return
+    else:
+        wired = int(limit_gb * 1024**3)
+        if max_wired > 0 and wired > max_wired:
+            logger.warning(
+                "SGLANG_MLX_WIRED_LIMIT_GB=%s (%.1f GB) exceeds the recommended "
+                "working set (%.1f GB); using the recommended size.",
+                limit_gb,
+                wired / 1024**3,
+                max_wired / 1024**3,
+            )
+            wired = max_wired
+    if wired > 0:
+        mx.set_wired_limit(wired)
+        logger.info(f"Wired memory limit set to {wired / (1024**3):.1f} GB")
+
+
 # Slack on a running request's measured device footprint (activations, allocator
 # rounding): the 256-request burst of Qwen3.5-4B (py-sglang#11) peaked 205 MB per
 # running request against 185.7 MB measured (snapshot state + first KV chunk), x1.10;
@@ -235,12 +267,7 @@ class MlxModelRunner:
 
         self._load_model()
 
-        # Pin MLX allocations to prevent OS paging
-        device_info = mx.device_info()
-        max_wired = int(device_info.get("max_recommended_working_set_size", 0))
-        if max_wired > 0:
-            mx.set_wired_limit(max_wired)
-            logger.info(f"Wired memory limit set to {max_wired / (1024**3):.1f} GB")
+        _apply_wired_limit()
 
         patch_model_attention(self.model)
 
