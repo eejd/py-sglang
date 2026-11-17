@@ -250,7 +250,7 @@ class TestRunnerBudget(unittest.TestCase):
         return aux, free, requests, (free * 3 // 4) // (4 * 32768)
 
     def test_the_budget_beside_the_snapshots_bounds_requests_and_live_tokens(self):
-        plain = self._runner(has_aux=False)
+        plain = self._runner(has_aux=False, disable_radix_cache=True)
         hybrid = self._runner()
 
         plain_slots = self._size(plain)
@@ -266,7 +266,8 @@ class TestRunnerBudget(unittest.TestCase):
         self.assertEqual(hybrid.max_live_requests, requests)
         self.assertEqual(hybrid_slots, tokens)
         # the running requests' private caches may add up to twice the live tokens
-        # (a cache's capacity is below twice its tokens); dense models have no bound
+        # (a cache's capacity is below twice its tokens); without the radix cache there
+        # is no bound
         self.assertEqual(hybrid.private_cache_budget_tokens, 2 * tokens)
         self.assertIsNone(plain.private_cache_budget_tokens)
         self.assertLess(hybrid_slots, plain_slots)
@@ -419,7 +420,48 @@ class TestRunnerBudget(unittest.TestCase):
 
         self.assertIsNone(runner._aux_state_budget_bytes)
         self.assertIsNone(runner.max_live_requests)
-        self.assertEqual(slots, self._size(self._runner(has_aux=False)))
+        self.assertEqual(
+            slots,
+            self._size(self._runner(has_aux=False, disable_radix_cache=True)),
+        )
+
+    def test_a_dense_model_with_the_radix_cache_budgets_its_private_caches(self):
+        runner = self._runner(has_aux=False, snapshot=0)
+
+        pool = self._size(runner)
+
+        budget = int(50 * GIB * runner._mem_fraction_static)
+        tokens = (budget * 3 // 4) // (4 * 32768)
+        self.assertEqual(pool, tokens)
+        self.assertEqual(runner.private_cache_budget_tokens, 2 * tokens)
+        self.assertEqual(
+            runner.max_live_requests, (budget // 4) // int(128 * MIB * 1.25)
+        )
+        self.assertIsNone(runner._aux_state_budget_bytes)
+        self.assertIsNone(runner.aux_state_slots)
+
+    def test_a_dense_model_with_an_explicit_pool_still_budgets_its_private_caches(
+        self,
+    ):
+        runner = self._runner(has_aux=False, snapshot=0)
+
+        pool = self._size(runner, explicit_size=4096)
+
+        budget = int(50 * GIB * runner._mem_fraction_static)
+        self.assertEqual(pool, 4096)
+        self.assertEqual(
+            runner.private_cache_budget_tokens, 2 * ((budget * 3 // 4) // (4 * 32768))
+        )
+
+    def test_a_dense_model_without_the_radix_cache_keeps_its_whole_budget(self):
+        runner = self._runner(has_aux=False, snapshot=0, disable_radix_cache=True)
+
+        pool = self._size(runner)
+
+        budget = int(50 * GIB * runner._mem_fraction_static)
+        self.assertEqual(pool, budget // 32768)
+        self.assertIsNone(runner.private_cache_budget_tokens)
+        self.assertIsNone(runner.max_live_requests)
 
     def test_init_cache_pools_hands_the_budget_to_the_auxiliary_pool(self):
         runner = self._runner()

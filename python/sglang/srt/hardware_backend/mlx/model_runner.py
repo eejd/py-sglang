@@ -280,7 +280,7 @@ class MlxModelRunner:
         # admission bound has to see before ``_req_caches`` does.
         self._prefill_caches: dict[str, list[Any]] = {}
         # Capacity tokens the running requests' private caches may add up to
-        # (hybrid model with the radix cache; set by ``_compute_pool_size``).
+        # (radix cache on; set by ``_compute_pool_size``).
         self.private_cache_budget_tokens: int | None = None
         self._req_token_ids: dict[str, list[int]] = {}
         self._req_sampling: dict[str, MlxSamplingParams] = {}
@@ -722,12 +722,14 @@ class MlxModelRunner:
     def _compute_pool_size(self, explicit_size: int | None) -> int:
         """Determine pool slot count (auto-size from available memory if needed).
 
-        A model with auxiliary (GDN/mamba) state and the radix cache on also
-        keeps one state snapshot per cached prefix, and every running request
-        holds its own live state and preallocated attention KV (a contiguous cache
-        that starts at ``_max_seq_len`` tokens and doubles). All of it is device
-        memory. The budget ``mem_fraction_static x working set - weights`` is
-        split:
+        Every model with the radix cache on is budgeted this way: every running
+        request holds its own preallocated attention KV (a contiguous cache that
+        starts at ``_max_seq_len`` tokens and doubles), which the token pool does
+        not account for. Snapshots exist only for models with auxiliary
+        (GDN/mamba) state: those also keep one state snapshot per cached prefix
+        and hold a live state per running request. All of it is device memory.
+        The budget ``mem_fraction_static x working set - weights`` is split (a
+        dense model has no snapshots, so ``free`` is the whole budget):
 
         * the snapshots get ``mamba_full_memory_ratio / (1 + ratio)`` of it (as on
           CUDA), or an explicit ``--max-mamba-cache-size`` times the measured
@@ -766,10 +768,9 @@ class MlxModelRunner:
         self.max_live_requests: int | None = None
         self.aux_state_slots: int | None = None
         self.private_cache_budget_tokens = None
-        hybrid_radix = (
-            self._cache_layout.has_auxiliary_state and not self.disable_radix_cache
-        )
-        if explicit_size is not None and not hybrid_radix:
+        radix = not self.disable_radix_cache
+        hybrid_radix = self._cache_layout.has_auxiliary_state and radix
+        if explicit_size is not None and not radix:
             return explicit_size
         n_kv_heads, head_dim, dtype = self._get_attn_config()
         # Only full-attention layers occupy pool slots. All-SWA models have no
@@ -793,49 +794,54 @@ class MlxModelRunner:
         bytes_per_slot = 2 * num_layers * n_kv_heads * head_dim * dtype.size
         token_cap: int | None = None
         free = 0
-        if hybrid_radix:
+        if radix:
+            # A dense model's snapshot bytes are 0 (no auxiliary layers).
             snapshot_bytes, live_kv_bytes = self._measure_request_footprint()
             per_request = int((snapshot_bytes + live_kv_bytes) * _LIVE_REQUEST_SLACK)
-            explicit_slots = get_schedule().max_mamba_cache_size
-            if explicit_slots is not None:
-                aux_budget = (
-                    explicit_slots // get_parallel().attn_dp_size
-                ) * snapshot_bytes
-                if (
-                    explicit_size is None
-                    and aux_budget > kv_budget - 256 * bytes_per_slot
-                ):
-                    raise ValueError(
-                        f"--max-mamba-cache-size {explicit_slots} needs "
-                        f"{aux_budget / 1024**3:.2f} GiB of snapshots "
-                        f"({snapshot_bytes / 1e6:.1f} MB each) but the device budget "
-                        f"is {kv_budget / 1024**3:.2f} GiB, which leaves no KV pool. "
-                        "Lower it or raise --mem-fraction-static."
-                    )
+            if hybrid_radix:
+                explicit_slots = get_schedule().max_mamba_cache_size
+                if explicit_slots is not None:
+                    aux_budget = (
+                        explicit_slots // get_parallel().attn_dp_size
+                    ) * snapshot_bytes
+                    if (
+                        explicit_size is None
+                        and aux_budget > kv_budget - 256 * bytes_per_slot
+                    ):
+                        raise ValueError(
+                            f"--max-mamba-cache-size {explicit_slots} needs "
+                            f"{aux_budget / 1024**3:.2f} GiB of snapshots "
+                            f"({snapshot_bytes / 1e6:.1f} MB each) but the device "
+                            f"budget is {kv_budget / 1024**3:.2f} GiB, which leaves "
+                            "no KV pool. Lower it or raise --mem-fraction-static."
+                        )
+                else:
+                    ratio = get_schedule().mamba_full_memory_ratio
+                    aux_budget = int(kv_budget * ratio / (1 + ratio))
+                free = max(kv_budget - aux_budget, 0)
+                slots = aux_budget // max(snapshot_bytes, 1)
+                # A running request holds a live and a tracked snapshot slot and its
+                # KV cache: bound the running requests by the budget and by the slots.
+                self.max_live_requests = max(
+                    1,
+                    min(
+                        (free // 4) // max(per_request, 1),
+                        max(slots, MIN_AUX_STATE_SLOTS) // 2,
+                    ),
+                )
+                self._aux_state_budget_bytes = aux_budget
+                self._snapshot_bytes = snapshot_bytes
             else:
-                ratio = get_schedule().mamba_full_memory_ratio
-                aux_budget = int(kv_budget * ratio / (1 + ratio))
-            free = max(kv_budget - aux_budget, 0)
-            slots = aux_budget // max(snapshot_bytes, 1)
-            # A running request holds a live and a tracked snapshot slot and its
-            # KV cache: bound the running requests by the budget and by the slots.
-            self.max_live_requests = max(
-                1,
-                min(
-                    (free // 4) // max(per_request, 1),
-                    max(slots, MIN_AUX_STATE_SLOTS) // 2,
-                ),
-            )
+                free = kv_budget
+                self.max_live_requests = max(1, (free // 4) // max(per_request, 1))
             token_cap = (free * 3 // 4) // (4 * bytes_per_slot)
             # Each live token also sits in a request's private cache of capacity
             # below twice its tokens: the caches may add up to twice the token bound.
             self.private_cache_budget_tokens = 2 * token_cap
-            self._aux_state_budget_bytes = aux_budget
-            self._snapshot_bytes = snapshot_bytes
             logger.info(
                 "Per-request footprint: snapshot %.1f MB, live attention KV %.1f MB; "
-                "%.2f GiB beside the snapshots for the KV pool and running requests: "
-                "max_live_requests=%d, live-token bound %d",
+                "%.2f GiB for the KV pool and running requests (beside the snapshots, "
+                "if any): max_live_requests=%d, live-token bound %d",
                 snapshot_bytes / 1e6,
                 live_kv_bytes / 1e6,
                 free / 1024**3,
@@ -846,17 +852,29 @@ class MlxModelRunner:
             token_cap < _MIN_COMFORTABLE_TOKENS
             or self.max_live_requests < _MIN_COMFORTABLE_REQUESTS
         ):
-            logger.warning(
-                "The device budget leaves %.2f GiB beside the snapshots for the KV "
-                "pool and the running requests (mem_fraction_static=%.3f): at most "
-                "%d running requests and %d live tokens. Raise --mem-fraction-static "
-                "or lower --max-mamba-cache-size / --mamba-full-memory-ratio to "
-                "serve more or longer requests.",
-                free / 1024**3,
-                self._mem_fraction_static,
-                self.max_live_requests,
-                token_cap,
-            )
+            if hybrid_radix:
+                logger.warning(
+                    "The device budget leaves %.2f GiB beside the snapshots for the "
+                    "KV pool and the running requests (mem_fraction_static=%.3f): at "
+                    "most %d running requests and %d live tokens. Raise "
+                    "--mem-fraction-static or lower --max-mamba-cache-size / "
+                    "--mamba-full-memory-ratio to serve more or longer requests.",
+                    free / 1024**3,
+                    self._mem_fraction_static,
+                    self.max_live_requests,
+                    token_cap,
+                )
+            else:
+                logger.warning(
+                    "The device budget leaves %.2f GiB for the KV pool and the "
+                    "running requests (mem_fraction_static=%.3f): at most %d running "
+                    "requests and %d live tokens. Raise --mem-fraction-static to "
+                    "serve more or longer requests.",
+                    free / 1024**3,
+                    self._mem_fraction_static,
+                    self.max_live_requests,
+                    token_cap,
+                )
         if explicit_size is not None:
             if token_cap is not None and explicit_size > token_cap:
                 logger.warning(
@@ -868,8 +886,9 @@ class MlxModelRunner:
                 )
             self._finish_aux_budget()
             return explicit_size
-        # With snapshots reserved the pool is the live-token bound, which is a share
-        # of what the snapshots leave (``free``); else it is the whole budget.
+        # With the radix cache on the pool is the live-token bound, which is a share
+        # of what the snapshots leave (``free``, the whole budget for a dense model);
+        # with it off the pool is the whole budget.
         if token_cap is not None:
             pool_size = max(token_cap, 256)
         else:
