@@ -283,6 +283,7 @@ class TestRunnerPrivateCacheAccounting(unittest.TestCase):
         runner._req_token_ids = {}
         runner._req_sampling = {}
         runner._req_synced_offset = {}
+        runner._pool_needs_eval = False
         runner._cache_pool = []
         self._run(runner, "r", 32_768)
         runner._prefill_caches["r"] = self._cache(32_768)

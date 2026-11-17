@@ -291,6 +291,7 @@ class MlxModelRunner:
         self._req_to_token_pool: ReqToTokenPool | None = None
         self._req_pool_idx: dict[str, int] = {}
         self._req_synced_offset: dict[str, int] = {}
+        self._pool_needs_eval: bool = False
 
         self._pool_size = self._compute_pool_size(pool_size)
         self._aot_kernels = self._build_aot_kernels()
@@ -1051,10 +1052,21 @@ class MlxModelRunner:
         # reuses caches only for models without it), so unevaluated the chain
         # keeps every request's cache alive (~130 MB each on Qwen3.5-4B: the device
         # out of memory after ~140 requests, py-sglang#11). Evaluating drops them.
-        # Dense models reuse their caches (flat memory over 500 distinct requests
-        # measured without it) and are spared the eval, which costs prefill latency.
+        # Dense scatters are evaluated in the same eval as the chunk that produced
+        # them (take_pool_eval_arrays). Left lazy, each pending scatter pins a full
+        # version of the request's contiguous cache, so the next write copies it
+        # (py-sglang#25).
         if self._cache_layout.has_auxiliary_state:
             mx.eval(*self._attention_kv_pool.all_buffers())
+        else:
+            self._pool_needs_eval = True
+
+    def take_pool_eval_arrays(self) -> list[mx.array]:
+        """Pool buffers written lazily since the last eval, for the caller's eval; [] if none."""
+        if not self._pool_needs_eval or self._attention_kv_pool is None:
+            return []
+        self._pool_needs_eval = False
+        return list(self._attention_kv_pool.all_buffers())
 
     def _sync_decode_kv_to_pool(self, req_id: str, end: int | None = None) -> None:
         """Sync un-flushed decode KV for *req_id* to the shared pool, up to
@@ -1082,6 +1094,11 @@ class MlxModelRunner:
             .tolist()
         )
         self._sync_new_kv_to_pool(cache, synced_offset, slot_ids)
+        # Runs outside any forward eval, and the released cache returns to
+        # _cache_pool for reuse: its scatter must not stay pending.
+        arrays = self.take_pool_eval_arrays()
+        if arrays:
+            mx.eval(*arrays)
         self._req_synced_offset[req_id] = current_offset
 
     def release_request_row(self, req_id: str, owned_len: int) -> None:
@@ -1556,6 +1573,7 @@ class MlxModelRunner:
             tokens,
             *self.cache_state_arrays(caches),
             *lazy_logprob_arrays(pending.lazy_logprobs),
+            *self.take_pool_eval_arrays(),
         )
 
     @staticmethod

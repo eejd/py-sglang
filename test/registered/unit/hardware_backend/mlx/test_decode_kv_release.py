@@ -69,6 +69,7 @@ def _runner(req_to_token_pool):
     runner._req_sampling = {}
     runner._req_pool_idx = {}
     runner._req_synced_offset = {}
+    runner._pool_needs_eval = False
     runner._attention_kv_pool = None
     runner._decode_step_ct = 0
     runner._clear_steps = 0
