@@ -488,6 +488,26 @@ class TestRunnerBudget(unittest.TestCase):
             self.assertTrue(any(buffer is a for a in handed))
         self.assertEqual(runner.take_pool_eval_arrays(), [])
 
+    def test_eval_pending_evaluates_the_dense_pool_scatters_with_the_chunk(self):
+        runner = self._runner(has_aux=False)
+        runner._attention_kv_pool = MlxAttentionKVPool(
+            pool_size=16, num_layers=1, n_kv_heads=1, head_dim=2, dtype=mx.float32
+        )
+        runner._pool_needs_eval = True
+        runner.cache_state_arrays = lambda caches: []
+        pending = SimpleNamespace(
+            lazy_token=mx.array([0]), cache=[], lazy_logprobs=None
+        )
+
+        with mock.patch(
+            "sglang.srt.hardware_backend.mlx.model_runner.mx.eval"
+        ) as evaluate:
+            runner.eval_pending(pending)
+
+        evaluated = list(evaluate.call_args.args)
+        for buffer in runner._attention_kv_pool.all_buffers():
+            self.assertTrue(any(buffer is a for a in evaluated))
+
     def test_releasing_a_dense_request_evaluates_its_unflushed_scatter(self):
         runner = self._runner(has_aux=False)
         runner._attention_kv_pool = MlxAttentionKVPool(
