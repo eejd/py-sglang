@@ -15,10 +15,14 @@ from sglang.srt.hardware_backend.mlx.aot import (
     MlxAOTRoPEContext,
 )
 from sglang.srt.hardware_backend.mlx.kv_cache.attention_contract import (
+    K_NORM_ATTRS,
+    Q_NORM_ATTRS,
+    first_present_attr,
     get_attention_scale,
     get_head_dim,
     get_num_heads,
     get_num_kv_heads,
+    get_output_proj,
 )
 from sglang.srt.hardware_backend.mlx.kv_cache.attention_kv_cache import (
     ContiguousAttentionKVCache,
@@ -219,8 +223,9 @@ class MLXAttentionWrapper(nn.Module):
         # None for modules that expose head_dim only through a projection
         # shape; _batched_decode falls back to the runtime K shape.
         object.__setattr__(self, "_head_dim", get_head_dim(inner))
-        object.__setattr__(self, "_has_q_norm", hasattr(inner, "q_norm"))
-        object.__setattr__(self, "_has_k_norm", hasattr(inner, "k_norm"))
+        object.__setattr__(self, "_o_proj", get_output_proj(inner))
+        object.__setattr__(self, "_q_norm", first_present_attr(inner, Q_NORM_ATTRS))
+        object.__setattr__(self, "_k_norm", first_present_attr(inner, K_NORM_ATTRS))
         # Only pass sinks when the module has them: the kwarg requires a
         # recent mlx and must not constrain models without sinks.
         sinks = getattr(inner, "sinks", None)
@@ -268,10 +273,10 @@ class MLXAttentionWrapper(nn.Module):
         keys = keys.reshape(B, 1, n_kv_heads, head_dim)
         values = values.reshape(B, 1, n_kv_heads, head_dim)
 
-        if self._has_q_norm:
-            queries = inner.q_norm(queries)
-        if self._has_k_norm:
-            keys = inner.k_norm(keys)
+        if self._q_norm is not None:
+            queries = self._q_norm(queries)
+        if self._k_norm is not None:
+            keys = self._k_norm(keys)
 
         queries = queries.transpose(0, 2, 1, 3)
         keys = keys.transpose(0, 2, 1, 3)
@@ -342,7 +347,7 @@ class MLXAttentionWrapper(nn.Module):
         output = output.transpose(0, 2, 1, 3).reshape(B, 1, -1)
         if gate is not None:
             output = output * mx.sigmoid(gate)
-        return inner.o_proj(output)
+        return self._o_proj(output)
 
     @staticmethod
     def _rope_custom_aot(
