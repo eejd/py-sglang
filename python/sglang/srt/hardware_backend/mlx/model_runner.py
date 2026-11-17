@@ -120,6 +120,7 @@ def _apply_wired_limit() -> None:
         mx.set_wired_limit(wired)
         logger.info(f"Wired memory limit set to {wired / (1024**3):.1f} GB")
 
+
 # Slack on a running request's measured device footprint (activations, allocator
 # rounding): the 256-request burst of Qwen3.5-4B (py-sglang#11) peaked 205 MB per
 # running request against 185.7 MB measured (snapshot state + first KV chunk), x1.10;
