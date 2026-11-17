@@ -1574,13 +1574,18 @@ class MlxModelRunner:
         root = getattr(self.model, "language_model", self.model)
         text_model = getattr(root, "model", root)
         embed = text_model.embed_tokens
-        norm = text_model.norm
-        if hasattr(root, "lm_head"):
-            lm_head = root.lm_head
-        elif hasattr(root, "args") and getattr(root.args, "tie_word_embeddings", False):
-            lm_head = text_model.embed_tokens.as_linear
-        else:
-            lm_head = root.lm_head
+        # LFM2 names its final norm ``embedding_norm`` and has no ``lm_head``
+        # (logits come from the tied embeddings).
+        norm = (
+            text_model.norm
+            if hasattr(text_model, "norm")
+            else text_model.embedding_norm
+        )
+        lm_head = (
+            root.lm_head
+            if hasattr(root, "lm_head")
+            else text_model.embed_tokens.as_linear
+        )
         return embed, norm, lm_head
 
     def _decode_with_hybrid_batching(

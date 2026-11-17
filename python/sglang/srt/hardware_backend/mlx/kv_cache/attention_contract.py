@@ -7,7 +7,12 @@ from typing import Any, Iterable
 # ``rope`` and a softmax scale are required by MLXAttentionWrapper. Keeping
 # them in the contract also prevents recurrent mixers such as DeltaNet from
 # being mistaken for softmax attention just because they expose projections.
-ATTENTION_API_ATTRS = ("q_proj", "k_proj", "v_proj", "o_proj", "rope")
+ATTENTION_API_ATTRS = ("q_proj", "k_proj", "v_proj", "rope")
+# The output projection and the per-head q/k norms have per-family names
+# (LFM2: ``out_proj``, ``q_layernorm`` / ``k_layernorm``).
+OUTPUT_PROJ_ATTRS = ("o_proj", "out_proj")
+Q_NORM_ATTRS = ("q_norm", "q_layernorm")
+K_NORM_ATTRS = ("k_norm", "k_layernorm")
 # Any one of these satisfies the scale requirement (gpt_oss uses ``sm_scale``).
 SCALE_ATTRS = ("scale", "sm_scale")
 NUM_HEAD_ATTRS = ("n_heads", "num_heads", "num_attention_heads")
@@ -59,9 +64,14 @@ def get_attention_scale(module: Any) -> float | None:
     return first_present_attr(module, SCALE_ATTRS)
 
 
+def get_output_proj(module: Any) -> Any | None:
+    return first_present_attr(module, OUTPUT_PROJ_ATTRS)
+
+
 def is_attention_module(module: Any) -> bool:
     return (
         all(hasattr(module, attr) for attr in ATTENTION_API_ATTRS)
+        and any(hasattr(module, attr) for attr in OUTPUT_PROJ_ATTRS)
         and any(hasattr(module, attr) for attr in SCALE_ATTRS)
         and get_num_heads(module) is not None
         and get_num_kv_heads(module) is not None

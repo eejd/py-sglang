@@ -199,6 +199,79 @@ class TestMlxAttentionPatching(unittest.TestCase):
         self.assertEqual(out.shape, (1, 1, 4))
         self.assertEqual(inner.o_proj.last_input_shape, (1, 1, 4))
 
+    def test_lfm2_names_find_attention_and_skip_the_short_conv(self):
+        class Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.n_heads = 2
+                self.n_kv_heads = 1
+                self.head_dim = 2
+                self.scale = self.head_dim**-0.5
+                self.q_proj = FakeProjection(4)
+                self.k_proj = FakeProjection(2)
+                self.v_proj = FakeProjection(2)
+                self.out_proj = FakeProjection(4)
+                self.q_layernorm = IdentityNorm()
+                self.k_layernorm = IdentityNorm()
+                self.rope = IdentityRope()
+
+        class ShortConv(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.in_proj = FakeProjection(12)
+                self.out_proj = FakeProjection(4)
+                self.conv = FakeProjection(4)
+
+        model = FakeModel(
+            [FakeLayer("self_attn", Attention()), FakeLayer("conv", ShortConv())]
+        )
+
+        _, attrs = find_attention_layers(model)
+
+        self.assertEqual(attrs, ["self_attn", None])
+        self.assertEqual(patch_model_attention(model), 1)
+
+    def test_batched_decode_matches_lfm2_attention(self):
+        from mlx_lm.models.lfm2 import Attention, ModelArgs
+
+        mx.random.seed(0)
+        args = ModelArgs(
+            model_type="lfm2",
+            vocab_size=32,
+            hidden_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            max_position_embeddings=64,
+            norm_eps=1e-5,
+            conv_bias=False,
+            conv_L_cache=3,
+            block_dim=16,
+            block_multiple_of=8,
+            block_ffn_dim_multiplier=1.0,
+            block_auto_adjust_ff_dim=False,
+            block_ff_dim=32,
+            layer_types=["full_attention"],
+        )
+        inner = Attention(args)
+        # make the q/k norms non-trivial so skipping them would show
+        inner.q_layernorm.weight = mx.random.uniform(0.5, 2.0, (8,))
+        inner.k_layernorm.weight = mx.random.uniform(0.5, 2.0, (8,))
+        x = mx.random.normal((1, 1, 16))
+        expected = inner(x)
+        wrapper = MLXAttentionWrapper(inner, layer_idx=0)
+        cache = ContiguousAttentionKVCache(
+            n_kv_heads=1, head_dim=8, max_seq_len=4, dtype=mx.float32
+        )
+        ctx = BatchedDecodeContext(
+            batch_size=1, seq_lens=[0], attention_layer_caches=[[cache]]
+        )
+
+        out = wrapper._batched_decode(x, ctx)
+        mx.eval(out, expected)
+
+        self.assertLess(mx.abs(out - expected).max().item(), 1e-5)
+
     def test_write_token_grows_buffer_past_max_seq_len(self):
         max_seq_len = 4
         cache = ContiguousAttentionKVCache(
