@@ -60,6 +60,29 @@ class TestMlxRuntime(unittest.TestCase):
             platform_hook.handle_hardware_runtime_validation(args)
             self.assertEqual(os.environ["GLOO_SOCKET_IFNAME"], "en0")
 
+    def test_speculative_decoding_is_refused_on_mlx(self):
+        from sglang.srt.arg_groups import platform_hook
+
+        args = types.SimpleNamespace(
+            tp_size=1,
+            pp_size=1,
+            dp_size=1,
+            nnodes=1,
+            speculative_algorithm="EAGLE3",
+        )
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            platform_hook, "use_mlx", return_value=True
+        ):
+            with self.assertRaisesRegex(
+                ValueError, r"--speculative-algorithm EAGLE3\) is not supported"
+            ):
+                platform_hook.handle_hardware_runtime_validation(args)
+            args.speculative_algorithm = None
+            platform_hook.handle_hardware_runtime_validation(args)
+        with mock.patch.object(platform_hook, "use_mlx", return_value=False):
+            args.speculative_algorithm = "EAGLE3"
+            platform_hook.handle_hardware_runtime_validation(args)
+
     def test_disabled_backend_does_not_import_mlx(self):
         script = """
 import sys

@@ -25,6 +25,13 @@ _gloo_loopback_installed = False
 def handle_hardware_runtime_validation(server_args: Any):
     # Validate even when device selection has not yet resolved.
     mlx = use_mlx()
+    algo = getattr(server_args, "speculative_algorithm", None)
+    if mlx and algo is not None:
+        raise ValueError(
+            f"Speculative decoding (--speculative-algorithm {algo}) is not "
+            "supported on the MLX backend (SGLANG_USE_MLX=1); launch without "
+            "--speculative-algorithm."
+        )
     global _gloo_loopback_installed
     local_only = (
         mlx
