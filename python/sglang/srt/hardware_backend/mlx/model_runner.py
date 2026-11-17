@@ -280,7 +280,7 @@ class MlxModelRunner:
         # admission bound has to see before ``_req_caches`` does.
         self._prefill_caches: dict[str, list[Any]] = {}
         # Capacity tokens the running requests' private caches may add up to
-        # (hybrid model with the radix cache; set by ``_compute_pool_size``).
+        # (radix cache on; set by ``_compute_pool_size``).
         self.private_cache_budget_tokens: int | None = None
         self._req_token_ids: dict[str, list[int]] = {}
         self._req_sampling: dict[str, MlxSamplingParams] = {}
@@ -840,8 +840,8 @@ class MlxModelRunner:
             self.private_cache_budget_tokens = 2 * token_cap
             logger.info(
                 "Per-request footprint: snapshot %.1f MB, live attention KV %.1f MB; "
-                "%.2f GiB beside the snapshots for the KV pool and running requests: "
-                "max_live_requests=%d, live-token bound %d",
+                "%.2f GiB for the KV pool and running requests (beside the snapshots, "
+                "if any): max_live_requests=%d, live-token bound %d",
                 snapshot_bytes / 1e6,
                 live_kv_bytes / 1e6,
                 free / 1024**3,
@@ -886,8 +886,9 @@ class MlxModelRunner:
                 )
             self._finish_aux_budget()
             return explicit_size
-        # With snapshots reserved the pool is the live-token bound, which is a share
-        # of what the snapshots leave (``free``); else it is the whole budget.
+        # With the radix cache on the pool is the live-token bound, which is a share
+        # of what the snapshots leave (``free``, the whole budget for a dense model);
+        # with it off the pool is the whole budget.
         if token_cap is not None:
             pool_size = max(token_cap, 256)
         else:
