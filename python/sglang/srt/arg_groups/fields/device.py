@@ -53,14 +53,16 @@ class Device(msgspec.Struct):
             "the lazy MLX graph, so it works with the overlap scheduler; "
             "first tokens from prefill/extend are sampled too. Greedy "
             "requests keep exact argmax behavior. Also enables on the MLX "
-            "path: grammar vocab masks and custom logit processors (these "
+            "path: custom logit processors (these "
             "break decode chaining per step; custom processors run on "
             "pure-decode steps only), logit_bias, output logprobs (sampled "
             "token / top-k / token_ids; prompt input logprobs are not "
             "computed), NaN sanitization (SGLANG_SANITIZE_NAN_LOGITS), and "
             "per-request sampling_seed under "
             "--enable-deterministic-inference (deterministic within MLX "
-            "only). Penalties are not applied."
+            "only). Penalties are not applied. Grammar-constrained requests "
+            "(response_format, tool_choice required or named, strict tools) are "
+            "enforced with or without this flag."
         ),
     ] = False
     watchdog_timeout: A[

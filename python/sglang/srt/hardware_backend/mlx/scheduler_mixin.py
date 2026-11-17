@@ -78,10 +78,11 @@ class SchedulerMlxOverlapMixin:
 
         Grammar vocab masks and custom logit processors depend on the
         previous token being materialized; a chained step is built before
-        that, so those batches launch fresh every step.
+        that, so those batches launch fresh every step.  Without the sampling
+        flag only grammars edit logits.
         """
         if not get_device().mlx_enable_sampling:
-            return True
+            return not batch.has_grammar
         sampling_info = batch.sampling_info
         if sampling_info is None:
             return True

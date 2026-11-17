@@ -258,8 +258,9 @@ class MlxTpModelWorker(TpModelWorker):
         ``apply_vocab_mask`` on a zeros tensor, which keeps this
         backend-agnostic (xgrammar / llguidance / outlines).
         """
-        if not self._sampling_active(batch):
+        if batch.sampling_info is None:
             return None
+        sampling = get_device().mlx_enable_sampling
         sinfo = batch.sampling_info
         # Mirror ForwardBatch.init_new's grammars population — the MLX paths
         # never build a ForwardBatch, so without this the list stays None
@@ -268,14 +269,19 @@ class MlxTpModelWorker(TpModelWorker):
             [req.grammar for req in batch.reqs] if batch.has_grammar else None
         )
         has_grammar = bool(sinfo.grammars)
-        if not has_grammar and sinfo.logit_bias is None:
+        # Grammars are enforced with or without the sampling flag; logit_bias
+        # stays a sampling-flag feature.
+        if not sampling and not has_grammar:
+            return None
+        logit_bias = sinfo.logit_bias if sampling else None
+        if not has_grammar and logit_bias is None:
             return None
         if not has_grammar:
             # logit_bias alone is already the dense [B, vocab] additive row we
             # want; converting it directly skips a second [B, vocab] float32
             # allocation and an add on every step (~6 MB of churn per step at
             # vocab 200k, batch 8).  Not mutated below, so no clone is needed.
-            combined = sinfo.logit_bias.to(device="cpu", dtype=torch.float32)
+            combined = logit_bias.to(device="cpu", dtype=torch.float32)
         else:
             combined = torch.zeros(
                 len(batch.reqs), sinfo.vocab_size, dtype=torch.float32
@@ -290,8 +296,8 @@ class MlxTpModelWorker(TpModelWorker):
                 # Release promptly; mirrors the VRAM-leak note in the CUDA
                 # ModelRunner._preprocess_logits.
                 sinfo.grammar_mask = None
-            if sinfo.logit_bias is not None:
-                combined += sinfo.logit_bias.to("cpu")
+            if logit_bias is not None:
+                combined += logit_bias.to("cpu")
         rows = mx.array(combined.numpy())
         return {req.rid: rows[i] for i, req in enumerate(batch.reqs)}
 

@@ -1447,7 +1447,14 @@ class MlxModelRunner:
         ints, so this is chained-decode safe.
         """
         if not self._enable_sampling:
-            return mx.argmax(last_logits, axis=-1), None
+            # Grammar masks apply without the sampling flag; unedited greedy
+            # output stays a bare argmax.
+            edited = (
+                self._edited_logits(last_logits, edit_rows)
+                if edit_rows is not None
+                else last_logits
+            )
+            return mx.argmax(edited, axis=-1), None
         params = [self._req_sampling[rid] for rid in req_ids]
         edited = self._edited_logits(last_logits, edit_rows)
         greedy = all_greedy(params)
