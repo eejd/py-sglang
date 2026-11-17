@@ -40,7 +40,9 @@ class TestMlxRuntime(unittest.TestCase):
     def test_gloo_loopback_default_and_topology(self):
         from sglang.srt.arg_groups import platform_hook
 
-        args = types.SimpleNamespace(tp_size=1, pp_size=1, dp_size=1, nnodes=1)
+        args = types.SimpleNamespace(
+            tp_size=1, pp_size=1, dp_size=1, nnodes=1, speculative_algorithm=None
+        )
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
             platform_hook, "use_mlx", return_value=True
         ), mock.patch.object(platform_hook, "_gloo_loopback_installed", False, create=True):
@@ -59,6 +61,29 @@ class TestMlxRuntime(unittest.TestCase):
             args.nnodes = 2
             platform_hook.handle_hardware_runtime_validation(args)
             self.assertEqual(os.environ["GLOO_SOCKET_IFNAME"], "en0")
+
+    def test_speculative_decoding_is_refused_on_mlx(self):
+        from sglang.srt.arg_groups import platform_hook
+
+        args = types.SimpleNamespace(
+            tp_size=1,
+            pp_size=1,
+            dp_size=1,
+            nnodes=1,
+            speculative_algorithm="EAGLE3",
+        )
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            platform_hook, "use_mlx", return_value=True
+        ):
+            with self.assertRaisesRegex(
+                ValueError, r"--speculative-algorithm EAGLE3\) is not supported"
+            ):
+                platform_hook.handle_hardware_runtime_validation(args)
+            args.speculative_algorithm = None
+            platform_hook.handle_hardware_runtime_validation(args)
+        with mock.patch.object(platform_hook, "use_mlx", return_value=False):
+            args.speculative_algorithm = "EAGLE3"
+            platform_hook.handle_hardware_runtime_validation(args)
 
     def test_disabled_backend_does_not_import_mlx(self):
         script = """
