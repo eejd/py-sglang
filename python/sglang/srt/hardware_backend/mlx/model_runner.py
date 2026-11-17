@@ -1501,8 +1501,9 @@ class MlxModelRunner:
     ) -> tuple[mx.array, MlxLazyLogprobs | None]:
         """Pick one token per row of ``last_logits`` — lazily, inside the graph.
 
-        Greedy behavior (sampling disabled, or every row greedy with no logit
-        edits) is exactly the pre-sampling ``mx.argmax``.  ``edit_rows`` is the
+        Greedy behavior (sampling disabled, or every row greedy) is
+        ``mx.argmax`` of the logits, edited by ``edit_rows`` when given; with no
+        edits it is exactly the pre-sampling ``mx.argmax``.  ``edit_rows`` is the
         worker's pre-combined additive [B, vocab] array (grammar mask +
         logit_bias), applied before token selection and logprobs, mirroring the
         CUDA ``ModelRunner._preprocess_logits`` order.  Positions for seeded
@@ -1510,7 +1511,14 @@ class MlxModelRunner:
         ints, so this is chained-decode safe.
         """
         if not self._enable_sampling:
-            return mx.argmax(last_logits, axis=-1), None
+            # Grammar masks apply without the sampling flag; unedited greedy
+            # output stays a bare argmax.
+            edited = (
+                self._edited_logits(last_logits, edit_rows)
+                if edit_rows is not None
+                else last_logits
+            )
+            return mx.argmax(edited, axis=-1), None
         params = [self._req_sampling[rid] for rid in req_ids]
         edited = self._edited_logits(last_logits, edit_rows)
         greedy = all_greedy(params)
