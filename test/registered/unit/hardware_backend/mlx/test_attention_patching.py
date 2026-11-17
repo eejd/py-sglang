@@ -302,6 +302,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         runner._req_token_ids = {}
         runner._req_pool_idx = {}
         runner._req_synced_offset = {}
+        runner._pool_needs_eval = False
         prefix_slots = mx.array([2, 3], dtype=mx.int32)
         k_prefix = mx.stack(
             [
@@ -718,6 +719,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         runner._req_token_ids = {}
         runner._req_pool_idx = {}
         runner._req_synced_offset = {}
+        runner._pool_needs_eval = False
         req = FakeRequest()
         runner._req_to_token_pool.alloc([req])
         runner._req_to_token_pool.auxiliary_state_pool.store_cache(
@@ -773,6 +775,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         runner._req_token_ids = {}
         runner._req_pool_idx = {}
         runner._req_synced_offset = {}
+        runner._pool_needs_eval = False
         pool = runner._req_to_token_pool
         tree_slot = pool.auxiliary_state_pool.alloc(1)
         pool.auxiliary_state_pool.store_cache(
@@ -1008,6 +1011,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         runner._req_token_ids = {}
         runner._req_pool_idx = {}
         runner._req_synced_offset = {}
+        runner._pool_needs_eval = False
         req = FakeRequest()
         runner._req_to_token_pool.alloc([req])
         token_ids = list(range(70))
@@ -1066,6 +1070,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         runner._req_token_ids = {}
         runner._req_pool_idx = {}
         runner._req_synced_offset = {}
+        runner._pool_needs_eval = False
         req = FakeRequest()
         runner._req_to_token_pool.alloc([req])
         runner._req_to_token_pool.auxiliary_state_pool.store_cache(

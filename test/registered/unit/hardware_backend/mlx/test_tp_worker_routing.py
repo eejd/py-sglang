@@ -67,6 +67,7 @@ class _FakeRunner:
         self.prefix_slot_ids: dict[str, list[int]] = {}
         self._req_caches: dict[str, list] = {}
         self.released: set[str] = set()
+        self.pool_eval_arrays: list = []
         self._counter = 0
 
     # --- shared ---
@@ -166,6 +167,9 @@ class _FakeRunner:
 
     def eval_pending(self, pending):
         pass
+
+    def take_pool_eval_arrays(self):
+        return list(self.pool_eval_arrays)
 
     @staticmethod
     def cache_state_arrays(caches):
@@ -336,6 +340,25 @@ class TestMlxExtendRouting(CustomTestCase):
         self.assertIs(runner.logits_flags[("extend_start", "r1")], True)
         self.assertEqual(len(launch.extends), 1)  # one pending extend
         self.assertIsNone(launch.decode)  # no mixed decode
+
+    def test_async_extend_evaluates_the_dense_pool_scatters_with_the_chunk(self):
+        """The pool buffers the chunk wrote lazily join its async eval (py-sglang#25)."""
+        from unittest import mock
+
+        import mlx.core as mx
+
+        sentinel = mx.array([7.0])
+        worker = self._worker(known_rids=set())
+        worker._mlx_runner.pool_eval_arrays = [sentinel]
+        batch = _FakeBatch(ForwardMode.EXTEND, [_FakeReq("r1")], [4])
+
+        with mock.patch(
+            "sglang.srt.hardware_backend.mlx.tp_worker.mx.async_eval"
+        ) as async_eval:
+            worker._async_extend_batch(batch)
+
+        evaluated = [a for call in async_eval.call_args_list for a in call.args]
+        self.assertTrue(any(sentinel is a for a in evaluated))
 
     def test_async_non_final_chunk_skips_logits(self):
         """Async twin of the head-skip derivation guard."""

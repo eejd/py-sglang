@@ -23,6 +23,7 @@ _HAS_MLX = importlib.util.find_spec("mlx") is not None
 
 if _HAS_MLX:
     import mlx.core as mx
+    import torch
 
     from sglang.srt.hardware_backend.mlx.kv_cache import (
         MlxAttentionKVPool,
@@ -464,10 +465,79 @@ class TestRunnerBudget(unittest.TestCase):
         for buffer in buffers:
             self.assertTrue(any(buffer is a for a in evaluated))
 
-    def test_a_dense_model_keeps_its_lazy_scatters(self):
-        _, evaluated = self._sync(has_aux=False)
+    def test_a_dense_models_scatters_are_handed_to_the_next_eval(self):
+        runner = self._runner(has_aux=False)
+        runner._attention_kv_pool = MlxAttentionKVPool(
+            pool_size=16, num_layers=1, n_kv_heads=1, head_dim=2, dtype=mx.float32
+        )
 
-        self.assertEqual(evaluated, [])
+        class _Attn:
+            keys = mx.ones((1, 1, 8, 2))
+            values = mx.ones((1, 1, 8, 2))
+
+        with mock.patch(
+            "sglang.srt.hardware_backend.mlx.model_runner.mx.eval"
+        ) as evaluate:
+            runner._sync_new_kv_to_pool([_Attn()], 0, [3, 4])
+        handed = runner.take_pool_eval_arrays()
+
+        evaluate.assert_not_called()
+        buffers = runner._attention_kv_pool.all_buffers()
+        self.assertEqual(len(handed), len(buffers))
+        for buffer in buffers:
+            self.assertTrue(any(buffer is a for a in handed))
+        self.assertEqual(runner.take_pool_eval_arrays(), [])
+
+    def test_eval_pending_evaluates_the_dense_pool_scatters_with_the_chunk(self):
+        runner = self._runner(has_aux=False)
+        runner._attention_kv_pool = MlxAttentionKVPool(
+            pool_size=16, num_layers=1, n_kv_heads=1, head_dim=2, dtype=mx.float32
+        )
+        runner._pool_needs_eval = True
+        runner.cache_state_arrays = lambda caches: []
+        pending = SimpleNamespace(
+            lazy_token=mx.array([0]), cache=[], lazy_logprobs=None
+        )
+
+        with mock.patch(
+            "sglang.srt.hardware_backend.mlx.model_runner.mx.eval"
+        ) as evaluate:
+            runner.eval_pending(pending)
+
+        evaluated = list(evaluate.call_args.args)
+        for buffer in runner._attention_kv_pool.all_buffers():
+            self.assertTrue(any(buffer is a for a in evaluated))
+
+    def test_releasing_a_dense_request_evaluates_its_unflushed_scatter(self):
+        runner = self._runner(has_aux=False)
+        runner._attention_kv_pool = MlxAttentionKVPool(
+            pool_size=16, num_layers=1, n_kv_heads=1, head_dim=2, dtype=mx.float32
+        )
+
+        class _Attn:
+            offset = 2
+            keys = mx.ones((1, 1, 8, 2))
+            values = mx.ones((1, 1, 8, 2))
+
+        runner._first_attention_cache = lambda cache: cache[0]
+        runner._req_caches = {"r": [_Attn()]}
+        runner._req_pool_idx = {"r": 0}
+        runner._req_synced_offset = {"r": 0}
+        runner._req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.tensor([[3, 4, 0, 0]])
+        )
+
+        with mock.patch(
+            "sglang.srt.hardware_backend.mlx.model_runner.mx.eval"
+        ) as evaluate:
+            runner._sync_decode_kv_to_pool("r")
+
+        evaluated = [a for call in evaluate.call_args_list for a in call.args]
+        buffers = runner._attention_kv_pool.all_buffers()
+        self.assertEqual(len(evaluated), len(buffers))
+        for buffer in buffers:
+            self.assertTrue(any(buffer is a for a in evaluated))
+        self.assertEqual(runner.take_pool_eval_arrays(), [])
 
 
 @unittest.skipUnless(_HAS_MLX, "requires mlx")

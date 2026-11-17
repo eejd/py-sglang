@@ -598,6 +598,7 @@ class MlxTpModelWorker(TpModelWorker):
                 self._mlx_runner.cache_state_arrays(pending_mixed_decode.caches)
             )
 
+        async_args.extend(self._mlx_runner.take_pool_eval_arrays())
         if async_args:
             mx.async_eval(*async_args)
 
