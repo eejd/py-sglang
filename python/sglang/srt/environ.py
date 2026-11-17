@@ -1113,6 +1113,9 @@ class Envs:
     SGLANG_MLX_CLEAR_CACHE_STEPS = EnvInt(256)
     # MLX buffer-cache cap in GB.
     SGLANG_MLX_CACHE_LIMIT_GB = EnvFloat(None)
+    # None: wire the recommended working set (upstream); 0: do not set a wired limit;
+    # N: wire N GiB (capped at the recommended size).
+    SGLANG_MLX_WIRED_LIMIT_GB = EnvFloat(None)
 
     # ===================================================================
     # Ascend NPU
