@@ -40,7 +40,9 @@ class TestMlxRuntime(unittest.TestCase):
     def test_gloo_loopback_default_and_topology(self):
         from sglang.srt.arg_groups import platform_hook
 
-        args = types.SimpleNamespace(tp_size=1, pp_size=1, dp_size=1, nnodes=1)
+        args = types.SimpleNamespace(
+            tp_size=1, pp_size=1, dp_size=1, nnodes=1, speculative_algorithm=None
+        )
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
             platform_hook, "use_mlx", return_value=True
         ), mock.patch.object(platform_hook, "_gloo_loopback_installed", False, create=True):

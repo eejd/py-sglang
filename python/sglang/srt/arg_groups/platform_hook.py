@@ -25,7 +25,9 @@ _gloo_loopback_installed = False
 def handle_hardware_runtime_validation(server_args: Any):
     # Validate even when device selection has not yet resolved.
     mlx = use_mlx()
-    algo = getattr(server_args, "speculative_algorithm", None)
+    # Resolved value: --enable-return-aux-hidden-states clears an algorithm that
+    # only names its capture convention.
+    algo = resolving_view(server_args).speculative_algorithm
     if mlx and algo is not None:
         raise ValueError(
             f"Speculative decoding (--speculative-algorithm {algo}) is not "
